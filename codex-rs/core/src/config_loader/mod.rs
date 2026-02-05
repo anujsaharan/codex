@@ -27,10 +27,22 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use dunce::canonicalize as normalize_path;
 use serde::Deserialize;
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::io;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 use std::path::PathBuf;
 use toml::Value as TomlValue;
+#[cfg(windows)]
+use windows_sys::Win32::System::Com::CoTaskMemFree;
+#[cfg(windows)]
+use windows_sys::Win32::UI::Shell::FOLDERID_ProgramData;
+#[cfg(windows)]
+use windows_sys::Win32::UI::Shell::KF_FLAG_DEFAULT;
+#[cfg(windows)]
+use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
 
 pub use cloud_requirements::CloudRequirementsLoader;
 pub use config_requirements::ConfigRequirements;
@@ -76,7 +88,7 @@ const DEFAULT_PROJECT_ROOT_MARKERS: &[&str] = &[".git"];
 /// - cloud:    managed cloud requirements
 /// - admin:    managed preferences (*)
 /// - system    `/etc/codex/requirements.toml` (Unix) or
-///             `%ProgramData%\OpenAI\Codex\requirements.toml` (Windows)
+///   `%ProgramData%\OpenAI\Codex\requirements.toml` (Windows)
 ///
 /// For backwards compatibility, we also load from
 /// `managed_config.toml` and map it to `requirements.toml`.
@@ -382,14 +394,12 @@ async fn load_requirements_toml(
 fn system_requirements_toml_file() -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        return Some(PathBuf::from("/etc/codex/requirements.toml"));
+        Some(PathBuf::from("/etc/codex/requirements.toml"))
     }
 
     #[cfg(windows)]
     {
-        return Some(windows_system_requirements_toml_file(
-            std::env::var_os("ProgramData").as_deref(),
-        ));
+        Some(windows_system_requirements_toml_file())
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -407,11 +417,55 @@ fn system_config_toml_file() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn windows_system_requirements_toml_file(program_data: Option<&std::ffi::OsStr>) -> PathBuf {
-    let base = program_data
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS));
+fn windows_system_requirements_toml_file() -> PathBuf {
+    let base = windows_program_data_dir_from_known_folder().unwrap_or_else(|err| {
+        tracing::warn!(
+            error = %err,
+            "Failed to resolve ProgramData known folder; using default path"
+        );
+        PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS)
+    });
     base.join("OpenAI\\Codex\\requirements.toml")
+}
+
+#[cfg(windows)]
+fn windows_program_data_dir_from_known_folder() -> io::Result<PathBuf> {
+    let mut path_ptr = std::ptr::null_mut::<u16>();
+    // SAFETY: SHGetKnownFolderPath initializes path_ptr with a CoTaskMem-allocated,
+    // null-terminated UTF-16 string on success.
+    let hr = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_ProgramData,
+            KF_FLAG_DEFAULT,
+            std::ptr::null_mut(),
+            &mut path_ptr,
+        )
+    };
+    if hr != 0 {
+        return Err(io::Error::other(format!(
+            "SHGetKnownFolderPath(FOLDERID_ProgramData) failed with HRESULT {hr:#010x}"
+        )));
+    }
+    if path_ptr.is_null() {
+        return Err(io::Error::other(
+            "SHGetKnownFolderPath(FOLDERID_ProgramData) returned a null pointer",
+        ));
+    }
+
+    // SAFETY: path_ptr is a valid null-terminated UTF-16 string allocated by
+    // SHGetKnownFolderPath and must be freed with CoTaskMemFree.
+    let path = unsafe {
+        let mut len = 0usize;
+        while *path_ptr.add(len) != 0 {
+            len += 1;
+        }
+        let wide = std::slice::from_raw_parts(path_ptr, len);
+        let path = PathBuf::from(OsString::from_wide(wide));
+        CoTaskMemFree(path_ptr.cast());
+        path
+    };
+
+    Ok(path)
 }
 
 async fn load_requirements_from_legacy_scheme(
@@ -852,7 +906,7 @@ impl From<LegacyManagedConfigToml> for ConfigRequirementsToml {
 mod unit_tests {
     use super::*;
     #[cfg(windows)]
-    use std::ffi::OsStr;
+    use std::path::Path;
     use tempfile::tempdir;
 
     #[test]
@@ -912,20 +966,16 @@ foo = "xyzzy"
 
     #[cfg(windows)]
     #[test]
-    fn windows_system_requirements_toml_file_uses_program_data_env_value() {
+    fn windows_system_requirements_toml_file_uses_expected_suffix() {
         assert_eq!(
-            windows_system_requirements_toml_file(Some(OsStr::new(r"D:\Data"))),
-            PathBuf::from(r"D:\Data").join("OpenAI\\Codex\\requirements.toml")
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_system_requirements_toml_file_uses_default_when_program_data_is_missing() {
-        assert_eq!(
-            windows_system_requirements_toml_file(None),
-            PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS)
+            windows_system_requirements_toml_file(),
+            windows_program_data_dir_from_known_folder()
+                .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS))
                 .join("OpenAI\\Codex\\requirements.toml")
+        );
+        assert!(
+            windows_system_requirements_toml_file()
+                .ends_with(Path::new("OpenAI").join("Codex").join("requirements.toml"))
         );
     }
 }
