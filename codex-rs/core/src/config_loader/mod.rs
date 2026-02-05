@@ -29,6 +29,7 @@ use dunce::canonicalize as normalize_path;
 use serde::Deserialize;
 use std::io;
 use std::path::Path;
+use std::path::PathBuf;
 use toml::Value as TomlValue;
 
 pub use cloud_requirements::CloudRequirementsLoader;
@@ -58,13 +59,13 @@ pub use state::ConfigLayerStack;
 pub use state::ConfigLayerStackOrdering;
 pub use state::LoaderOverrides;
 
-/// On Unix systems, load requirements from this file path, if present.
-const DEFAULT_REQUIREMENTS_TOML_FILE_UNIX: &str = "/etc/codex/requirements.toml";
-
 /// On Unix systems, load default settings from this file path, if present.
 /// Note that /etc/codex/ is treated as a "config folder," so subfolders such
 /// as skills/ and rules/ will also be honored.
 pub const SYSTEM_CONFIG_TOML_FILE_UNIX: &str = "/etc/codex/config.toml";
+
+#[cfg(windows)]
+const DEFAULT_PROGRAM_DATA_DIR_WINDOWS: &str = r"C:\ProgramData";
 
 const DEFAULT_PROJECT_ROOT_MARKERS: &[&str] = &[".git"];
 
@@ -74,11 +75,11 @@ const DEFAULT_PROJECT_ROOT_MARKERS: &[&str] = &[".git"];
 ///
 /// - cloud:    managed cloud requirements
 /// - admin:    managed preferences (*)
-/// - system    `/etc/codex/requirements.toml`
+/// - system    `/etc/codex/requirements.toml` (Unix) or
+///             `%ProgramData%\OpenAI\Codex\requirements.toml` (Windows)
 ///
 /// For backwards compatibility, we also load from
-/// `/etc/codex/managed_config.toml` and map it to
-/// `/etc/codex/requirements.toml`.
+/// `managed_config.toml` and map it to `requirements.toml`.
 ///
 /// Configuration is built up from multiple layers in the following order:
 ///
@@ -121,13 +122,9 @@ pub async fn load_config_layers_state(
     )
     .await?;
 
-    // Honor /etc/codex/requirements.toml.
-    if cfg!(unix) {
-        load_requirements_toml(
-            &mut config_requirements_toml,
-            DEFAULT_REQUIREMENTS_TOML_FILE_UNIX,
-        )
-        .await?;
+    // Honor the system requirements.toml location.
+    if let Some(requirements_toml_file) = system_requirements_toml_file() {
+        load_requirements_toml(&mut config_requirements_toml, requirements_toml_file).await?;
     }
 
     // Make a best-effort to support the legacy `managed_config.toml` as a
@@ -157,14 +154,9 @@ pub async fn load_config_layers_state(
 
     // Include an entry for the "system" config folder, loading its config.toml,
     // if it exists.
-    let system_config_toml_file = if cfg!(unix) {
-        Some(AbsolutePathBuf::from_absolute_path(
-            SYSTEM_CONFIG_TOML_FILE_UNIX,
-        )?)
-    } else {
-        // TODO(gt): Determine the path to load on Windows.
-        None
-    };
+    let system_config_toml_file = system_config_toml_file()
+        .map(AbsolutePathBuf::try_from)
+        .transpose()?;
     if let Some(system_config_toml_file) = system_config_toml_file {
         let system_layer =
             load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
@@ -343,8 +335,9 @@ async fn load_config_toml_for_required_layer(
     Ok(create_entry(toml_value))
 }
 
-/// If available, apply requirements from `/etc/codex/requirements.toml` to
-/// `config_requirements_toml` by filling in any unset fields.
+/// If available, apply requirements from the platform system
+/// `requirements.toml` location to `config_requirements_toml` by filling in
+/// any unset fields.
 async fn load_requirements_toml(
     config_requirements_toml: &mut ConfigRequirementsWithSources,
     requirements_toml_file: impl AsRef<Path>,
@@ -384,6 +377,41 @@ async fn load_requirements_toml(
     }
 
     Ok(())
+}
+
+fn system_requirements_toml_file() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        return Some(PathBuf::from("/etc/codex/requirements.toml"));
+    }
+
+    #[cfg(windows)]
+    {
+        return Some(windows_system_requirements_toml_file(
+            std::env::var_os("ProgramData").as_deref(),
+        ));
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+fn system_config_toml_file() -> Option<PathBuf> {
+    if cfg!(unix) {
+        Some(PathBuf::from(SYSTEM_CONFIG_TOML_FILE_UNIX))
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_system_requirements_toml_file(program_data: Option<&std::ffi::OsStr>) -> PathBuf {
+    let base = program_data
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS));
+    base.join("OpenAI\\Codex\\requirements.toml")
 }
 
 async fn load_requirements_from_legacy_scheme(
@@ -823,6 +851,8 @@ impl From<LegacyManagedConfigToml> for ConfigRequirementsToml {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    #[cfg(windows)]
+    use std::ffi::OsStr;
     use tempfile::tempdir;
 
     #[test]
@@ -877,6 +907,25 @@ foo = "xyzzy"
                 SandboxModeRequirement::ReadOnly,
                 SandboxModeRequirement::WorkspaceWrite
             ])
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_requirements_toml_file_uses_program_data_env_value() {
+        assert_eq!(
+            windows_system_requirements_toml_file(Some(OsStr::new(r"D:\Data"))),
+            PathBuf::from(r"D:\Data").join("OpenAI\\Codex\\requirements.toml")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_requirements_toml_file_uses_default_when_program_data_is_missing() {
+        assert_eq!(
+            windows_system_requirements_toml_file(None),
+            PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS)
+                .join("OpenAI\\Codex\\requirements.toml")
         );
     }
 }
