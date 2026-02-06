@@ -211,6 +211,7 @@ use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::dynamic_tools::DynamicToolSpec as CoreDynamicToolSpec;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::input_modalities_from_mask;
@@ -1871,7 +1872,7 @@ impl CodexMessageProcessor {
                         {
                             Ok(summary) => {
                                 let conversation_modalities = resolve_conversation_modalities(
-                                    state_db_ctx.as_deref(),
+                                    state_db_ctx.as_ref(),
                                     thread_id,
                                     None,
                                     Some(rollout_path.as_path()),
@@ -2204,7 +2205,7 @@ impl CodexMessageProcessor {
                 message: format!("failed to update unarchived thread timestamp: {err}"),
                 data: None,
             })?;
-            if let Some(ctx) = state_db_ctx {
+            if let Some(ctx) = state_db_ctx.as_ref() {
                 let _ = ctx
                     .mark_unarchived(thread_id, restored_path.as_path())
                     .await;
@@ -2218,7 +2219,7 @@ impl CodexMessageProcessor {
                         data: None,
                     })?;
             let conversation_modalities = resolve_conversation_modalities(
-                state_db_ctx.as_deref(),
+                state_db_ctx.as_ref(),
                 summary.conversation_id,
                 None,
                 Some(summary.path.as_path()),
@@ -2358,7 +2359,7 @@ impl CodexMessageProcessor {
         let mut data = Vec::with_capacity(summaries.len());
         for summary in summaries {
             let conversation_modalities = resolve_conversation_modalities(
-                state_db_ctx.as_deref(),
+                state_db_ctx.as_ref(),
                 summary.conversation_id,
                 None,
                 Some(summary.path.as_path()),
@@ -2483,7 +2484,7 @@ impl CodexMessageProcessor {
 
         let mut thread = if let Some(summary) = db_summary {
             let conversation_modalities = resolve_conversation_modalities(
-                state_db_ctx.as_deref(),
+                state_db_ctx.as_ref(),
                 thread_uuid,
                 None,
                 rollout_path.as_deref(),
@@ -2495,7 +2496,7 @@ impl CodexMessageProcessor {
             match read_summary_from_rollout(rollout_path, fallback_provider).await {
                 Ok(summary) => {
                     let conversation_modalities = resolve_conversation_modalities(
-                        state_db_ctx.as_deref(),
+                        state_db_ctx.as_ref(),
                         thread_uuid,
                         None,
                         Some(rollout_path.as_path()),
@@ -2535,7 +2536,7 @@ impl CodexMessageProcessor {
             }
             let mut thread = build_ephemeral_thread(thread_uuid, &config_snapshot);
             if let Some(modalities) =
-                fetch_state_db_conversation_modalities(state_db_ctx.as_deref(), thread_uuid).await
+                fetch_state_db_conversation_modalities(state_db_ctx.as_ref(), thread_uuid).await
             {
                 thread.conversation_modalities = Some(modalities);
             }
@@ -2773,7 +2774,7 @@ impl CodexMessageProcessor {
                     }
                 };
                 let conversation_modalities = resolve_conversation_modalities(
-                    state_db_ctx.as_deref(),
+                    state_db_ctx.as_ref(),
                     thread_id,
                     None,
                     Some(rollout_path.as_path()),
@@ -2988,8 +2989,9 @@ impl CodexMessageProcessor {
                 return;
             }
         };
+        let state_db_ctx = get_state_db(&self.config, None).await;
         let conversation_modalities = resolve_conversation_modalities(
-            state_db_ctx.as_deref(),
+            state_db_ctx.as_ref(),
             thread_id,
             None,
             Some(rollout_path.as_path()),
@@ -4314,7 +4316,7 @@ impl CodexMessageProcessor {
         if has_image_input {
             let modalities = conversation_modalities_for_has_image(true);
             persist_conversation_modalities(
-                conversation.state_db(),
+                conversation.state_db().as_ref(),
                 conversation_id,
                 &modalities,
             )
@@ -4380,7 +4382,7 @@ impl CodexMessageProcessor {
         if has_image_input {
             let modalities = conversation_modalities_for_has_image(true);
             persist_conversation_modalities(
-                conversation.state_db(),
+                conversation.state_db().as_ref(),
                 conversation_id,
                 &modalities,
             )
@@ -4918,7 +4920,7 @@ impl CodexMessageProcessor {
                 Ok(summary) => {
                     let state_db_ctx = get_state_db(&self.config, None).await;
                     let conversation_modalities = resolve_conversation_modalities(
-                        state_db_ctx.as_deref(),
+                        state_db_ctx.as_ref(),
                         summary.conversation_id,
                         None,
                         Some(rollout_path.as_path()),
@@ -5858,11 +5860,12 @@ pub(crate) async fn resolve_conversation_modalities(
     };
 
     match read_rollout_has_image_context(rollout_path).await {
-        Ok(has_image_context) => {
+        Ok(Some(has_image_context)) => {
             let modalities = conversation_modalities_for_has_image(has_image_context);
             persist_conversation_modalities(state_db_ctx, thread_id, &modalities).await;
             Some(modalities)
         }
+        Ok(None) => None,
         Err(err) => {
             warn!(
                 "failed to determine conversation modalities for rollout {}: {err}",
@@ -5873,24 +5876,57 @@ pub(crate) async fn resolve_conversation_modalities(
     }
 }
 
-pub(crate) async fn read_rollout_has_image_context(path: &Path) -> std::io::Result<bool> {
+pub(crate) async fn read_rollout_has_image_context(
+    path: &Path,
+) -> std::io::Result<Option<bool>> {
     let items = match RolloutRecorder::get_rollout_history(path).await? {
         InitialHistory::New => Vec::new(),
         InitialHistory::Forked(items) => items,
         InitialHistory::Resumed(resumed) => resumed.history,
     };
 
-    Ok(items.into_iter().rev().any(|item| match item {
-        RolloutItem::ResponseItem(response_item) => response_item.has_input_image(),
-        RolloutItem::EventMsg(EventMsg::UserMessage(user_message)) => {
-            user_message
-                .images
-                .as_ref()
-                .is_some_and(|images| !images.is_empty())
-                || !user_message.local_images.is_empty()
+    let mut saw_input = false;
+    for item in items.into_iter().rev() {
+        match item {
+            RolloutItem::ResponseItem(response_item) => {
+                if response_item.has_input_image() {
+                    return Ok(Some(true));
+                }
+                if response_item_has_input_text(&response_item) {
+                    saw_input = true;
+                }
+            }
+            RolloutItem::EventMsg(EventMsg::UserMessage(user_message)) => {
+                if user_message
+                    .images
+                    .as_ref()
+                    .is_some_and(|images| !images.is_empty())
+                    || !user_message.local_images.is_empty()
+                {
+                    return Ok(Some(true));
+                }
+                saw_input = true;
+            }
+            _ => {}
+        }
+    }
+
+    if saw_input {
+        Ok(Some(false))
+    } else {
+        Ok(None)
+    }
+}
+
+fn response_item_has_input_text(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { content, .. } => {
+            content
+                .iter()
+                .any(|item| matches!(item, ContentItem::InputText { .. }))
         }
         _ => false,
-    }))
+    }
 }
 
 fn conversation_modalities_for_has_image(has_image_context: bool) -> Vec<InputModality> {
@@ -6233,7 +6269,10 @@ mod tests {
         }
         fs::write(&path, contents)?;
 
-        assert_eq!(read_rollout_has_image_context(path.as_path()).await?, true);
+        assert_eq!(
+            read_rollout_has_image_context(path.as_path()).await?,
+            Some(true)
+        );
         Ok(())
     }
 }
