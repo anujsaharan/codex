@@ -78,6 +78,10 @@ crate.annotation(
 crate.annotation(
     build_script_data_select = {
         "aarch64-unknown-linux-gnu": ["@aws-lc//:crypto"],
+        "aarch64-apple-darwin": [],
+        "aarch64-pc-windows-gnullvm": [],
+        "x86_64-apple-darwin": [],
+        "x86_64-pc-windows-gnullvm": [],
         "x86_64-unknown-linux-gnu": ["@aws-lc//:crypto"],
     },
     build_script_env = {
