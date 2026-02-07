@@ -78,9 +78,7 @@ crate.annotation(
 crate.annotation(
     build_script_data_select = {
         "aarch64-unknown-linux-gnu": ["@aws-lc//:crypto"],
-        "aarch64-unknown-linux-musl": ["@aws-lc//:crypto"],
         "x86_64-unknown-linux-gnu": ["@aws-lc//:crypto"],
-        "x86_64-unknown-linux-musl": ["@aws-lc//:crypto"],
     },
     build_script_env = {
         "AWS_LC_SYS_NO_JITTER_ENTROPY": "1",
@@ -88,9 +86,7 @@ crate.annotation(
     },
     build_script_env_select = {
         "aarch64-unknown-linux-gnu": "{\"AWS_LC_SYS_PREBUILT_CRYPTO\":\"$(rootpaths @aws-lc//:crypto)\"}",
-        "aarch64-unknown-linux-musl": "{\"AWS_LC_SYS_PREBUILT_CRYPTO\":\"$(rootpaths @aws-lc//:crypto)\"}",
         "x86_64-unknown-linux-gnu": "{\"AWS_LC_SYS_PREBUILT_CRYPTO\":\"$(rootpaths @aws-lc//:crypto)\"}",
-        "x86_64-unknown-linux-musl": "{\"AWS_LC_SYS_PREBUILT_CRYPTO\":\"$(rootpaths @aws-lc//:crypto)\"}",
     },
     patch_args = ["-p1"],
     patches = [
