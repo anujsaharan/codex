@@ -1,18 +1,19 @@
 diff --git a/builder/main.rs b/builder/main.rs
+index 24fc883..d78f270 100644
 --- a/builder/main.rs
 +++ b/builder/main.rs
-@@ -15,6 +15,7 @@
+@@ -15,6 +15,7 @@ use std::fmt::Debug;
  use std::path::{Path, PathBuf};
  use std::process::Command;
  use std::{env, fmt};
-+use std::collections::HashSet;
-
++use std::fs;
+ 
  use cc_builder::CcBuilder;
  use cmake_builder::CmakeBuilder;
-@@ -244,6 +245,135 @@
+@@ -244,6 +245,148 @@ impl OutputLib {
      }
  }
-
+ 
 +#[derive(Clone)]
 +struct PrebuiltLibrary {
 +    path: PathBuf,
@@ -66,18 +67,31 @@ diff --git a/builder/main.rs b/builder/main.rs
 +        })
 +    }
 +
-+    fn link_dir(&self) -> Option<PathBuf> {
-+        self.path.parent().map(Path::to_path_buf)
++    fn stage_for_linking(&self, out_dir: &Path) -> Result<PathBuf, String> {
++        let file_name = self
++            .path
++            .file_name()
++            .ok_or_else(|| format!("Missing file name for {}", self.path.display()))?;
++        let staged_path = out_dir.join(file_name);
++        fs::copy(&self.path, &staged_path).map_err(|err| {
++            format!(
++                "Failed to stage prebuilt AWS-LC library from {} to {}: {err}",
++                self.path.display(),
++                staged_path.display()
++            )
++        })?;
++        Ok(staged_path)
 +    }
 +}
 +
 +struct PrebuiltBuilder {
 +    libraries: PrebuiltLibraries,
++    out_dir: PathBuf,
 +}
 +
 +impl PrebuiltBuilder {
-+    fn new(libraries: PrebuiltLibraries) -> Self {
-+        Self { libraries }
++    fn new(libraries: PrebuiltLibraries, out_dir: PathBuf) -> Self {
++        Self { libraries, out_dir }
 +    }
 +}
 +
@@ -143,12 +157,12 @@ diff --git a/builder/main.rs b/builder/main.rs
 +}
 +
  const VERSION: &str = env!("CARGO_PKG_VERSION");
-
+ 
  fn prefix_string() -> String {
-@@ -469,6 +599,41 @@
+@@ -469,6 +612,44 @@ trait Builder {
      fn name(&self) -> &str;
  }
-
+ 
 +impl Builder for PrebuiltBuilder {
 +    fn check_dependencies(&self) -> Result<(), String> {
 +        for lib in self.libraries.iter() {
@@ -163,13 +177,16 @@ diff --git a/builder/main.rs b/builder/main.rs
 +    }
 +
 +    fn build(&self) -> Result<(), String> {
-+        let mut search_paths = HashSet::new();
++        let staged_dir = self.out_dir.join("prebuilt-libs");
++        fs::create_dir_all(&staged_dir).map_err(|err| {
++            format!(
++                "Failed to create staged prebuilt AWS-LC directory {}: {err}",
++                staged_dir.display()
++            )
++        })?;
++        println!("cargo:rustc-link-search=native={}", staged_dir.display());
 +        for lib in self.libraries.iter() {
-+            if let Some(dir) = lib.link_dir() {
-+                if search_paths.insert(dir.clone()) {
-+                    println!("cargo:rustc-link-search=native={}", dir.display());
-+                }
-+            }
++            let _ = lib.stage_for_linking(&staged_dir)?;
 +            println!(
 +                "cargo:rustc-link-lib={}={}",
 +                lib.link_type.rust_lib_type(),
@@ -187,8 +204,8 @@ diff --git a/builder/main.rs b/builder/main.rs
  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
  pub(crate) enum CStdRequested {
      C99,
-@@ -733,14 +898,21 @@
-
+@@ -733,14 +914,21 @@ fn main() {
+ 
      let manifest_dir = current_dir();
      let manifest_dir = dunce::canonicalize(Path::new(&manifest_dir)).unwrap();
 +    let out_dir = out_dir();
@@ -200,18 +217,18 @@ diff --git a/builder/main.rs b/builder/main.rs
      } else {
          Some(prefix_str)
      };
-
+ 
 -    let builder = get_builder(&prefix, &manifest_dir, &out_dir());
 +    let builder: Box<dyn Builder> = if let Some(ref libraries) = prebuilt_libraries {
 +        emit_warning("Using prebuilt AWS-LC libraries provided via AWS_LC_SYS_PREBUILT_*");
-+        Box::new(PrebuiltBuilder::new(libraries.clone()))
++        Box::new(PrebuiltBuilder::new(libraries.clone(), out_dir.clone()))
 +    } else {
 +        get_builder(&prefix, &manifest_dir, &out_dir)
 +    };
      emit_warning(format!("Building with: {}", builder.name()));
      emit_warning(format!("Symbol Prefix: {:?}", &prefix));
-
-@@ -797,7 +969,7 @@
+ 
+@@ -797,7 +985,7 @@ fn main() {
                  "External bindgen required, but external bindgen unable to produce SSL bindings.",
              );
          } else {
@@ -220,14 +237,14 @@ diff --git a/builder/main.rs b/builder/main.rs
              let result = invoke_external_bindgen(&manifest_dir, &prefix, &gen_bindings_path);
              match result {
                  Ok(()) => {
-@@ -818,13 +990,25 @@
-
+@@ -818,13 +1006,25 @@ fn main() {
+ 
      println!(
          "cargo:include={}",
 -        setup_include_paths(&out_dir(), &manifest_dir).display()
 +        setup_include_paths(&out_dir, &manifest_dir).display()
      );
-
+ 
      // export the artifact names
 -    println!("cargo:libcrypto={}_crypto", prefix_string());
 -    if cfg!(feature = "ssl") {
@@ -248,5 +265,5 @@ diff --git a/builder/main.rs b/builder/main.rs
 +    if let Some(name) = libssl_name {
 +        println!("cargo:libssl={name}");
      }
-
+ 
      println!("cargo:conf={}", OSSL_CONF_DEFINES.join(","));

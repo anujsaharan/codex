@@ -16,6 +16,7 @@ osx.framework(name = "CoreGraphics")
 osx.framework(name = "CoreServices")
 osx.framework(name = "CoreText")
 osx.framework(name = "CFNetwork")
+osx.framework(name = "DiskArbitration")
 osx.framework(name = "Foundation")
 osx.framework(name = "ImageIO")
 osx.framework(name = "Kernel")
@@ -78,16 +79,10 @@ crate.annotation(
 crate.annotation(
     build_script_data = [
         "@aws-lc//:crypto",
-        "@aws-lc//:ssl",
     ],
     build_script_env = {
         "AWS_LC_SYS_NO_JITTER_ENTROPY": "1",
         "AWS_LC_SYS_PREBUILT_CRYPTO": "$(rootpaths @aws-lc//:crypto)",
-        "AWS_LC_SYS_PREBUILT_SSL": "$(rootpaths @aws-lc//:ssl)",
-    },
-    deps = [
-        "@aws-lc//:crypto",
-        "@aws-lc//:ssl",
     ],
     patch_args = ["-p1"],
     patches = [
