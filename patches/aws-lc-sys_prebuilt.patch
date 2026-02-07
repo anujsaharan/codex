@@ -68,11 +68,17 @@ index 24fc883..d78f270 100644
 +    }
 +
 +    fn stage_for_linking(&self, out_dir: &Path) -> Result<PathBuf, String> {
-+        let file_name = self
-+            .path
-+            .file_name()
-+            .ok_or_else(|| format!("Missing file name for {}", self.path.display()))?;
-+        let staged_path = out_dir.join(file_name);
++        let extension = self.path.extension().and_then(|ext| ext.to_str());
++        let staged_file_name = match extension {
++            Some("a") => format!("lib{}.a", self.link_name),
++            Some("so") => format!("lib{}.so", self.link_name),
++            Some("dylib") => format!("lib{}.dylib", self.link_name),
++            Some("dll") => format!("{}.dll", self.link_name),
++            Some("lib") => format!("{}.lib", self.link_name),
++            Some(other) => format!("{}.{}", self.link_name, other),
++            None => self.link_name.clone(),
++        };
++        let staged_path = out_dir.join(staged_file_name);
 +        fs::copy(&self.path, &staged_path).map_err(|err| {
 +            format!(
 +                "Failed to stage prebuilt AWS-LC library from {} to {}: {err}",
@@ -118,16 +124,18 @@ index 24fc883..d78f270 100644
 +    })
 +}
 +
-+fn prebuilt_library_from_env(var: &str) -> Option<PrebuiltLibrary> {
++fn prebuilt_library_from_env(var: &str, kind: &str) -> Option<PrebuiltLibrary> {
 +    optional_env_crate_target(var).map(|value| {
 +        let path = select_prebuilt_path(var, &value).unwrap_or_else(|err| panic!("{err}"));
-+        PrebuiltLibrary::new(path).unwrap_or_else(|err| panic!("{err}"))
++        let mut library = PrebuiltLibrary::new(path).unwrap_or_else(|err| panic!("{err}"));
++        library.link_name = format!("aws_lc_sys_prebuilt_{kind}");
++        library
 +    })
 +}
 +
 +fn detect_prebuilt_libraries() -> Option<PrebuiltLibraries> {
-+    let crypto = prebuilt_library_from_env("PREBUILT_CRYPTO");
-+    let ssl = prebuilt_library_from_env("PREBUILT_SSL");
++    let crypto = prebuilt_library_from_env("PREBUILT_CRYPTO", "crypto");
++    let ssl = prebuilt_library_from_env("PREBUILT_SSL", "ssl");
 +
 +    if crypto.is_none() && ssl.is_none() {
 +        return None;
