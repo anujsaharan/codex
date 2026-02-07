@@ -106,7 +106,7 @@ crate.annotation(
     build_script_env = {
         "OPENSSL_DIR": "$(execpath @openssl//:gen_dir)",
         "OPENSSL_NO_VENDOR": "1",
-        "OPENSSL_STATIC": "1",
+        "OPENSSL_STATIC": "0",
     },
     crate = "openssl-sys",
     data = ["@openssl//:gen_dir"],
@@ -148,13 +148,6 @@ crate.annotation(
     crate = "windows_aarch64_gnullvm",
     gen_build_script = "off",
     deps = [":windows_import_lib"],
-)
-crate.annotation(
-    crate = "rama-tls-rustls",
-    patch_args = ["-p1"],
-    patches = [
-        "//patches:rama-tls-rustls_ring.patch",
-    ],
 )
 use_repo(crate, "crates")
 
