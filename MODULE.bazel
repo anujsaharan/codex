@@ -16,6 +16,7 @@ osx.framework(name = "CoreGraphics")
 osx.framework(name = "CoreServices")
 osx.framework(name = "CoreText")
 osx.framework(name = "CFNetwork")
+osx.framework(name = "DriverKit")
 osx.framework(name = "DiskArbitration")
 osx.framework(name = "Foundation")
 osx.framework(name = "ImageIO")
@@ -111,7 +112,7 @@ crate.annotation(
     build_script_env = {
         "OPENSSL_DIR": "$(execpath @openssl//:gen_dir)",
         "OPENSSL_NO_VENDOR": "1",
-        "OPENSSL_STATIC": "0",
+        "OPENSSL_STATIC": "1",
     },
     crate = "openssl-sys",
     data = ["@openssl//:gen_dir"],
