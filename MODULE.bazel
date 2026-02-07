@@ -83,7 +83,7 @@ crate.annotation(
     build_script_env = {
         "AWS_LC_SYS_NO_JITTER_ENTROPY": "1",
         "AWS_LC_SYS_PREBUILT_CRYPTO": "$(rootpaths @aws-lc//:crypto)",
-    ],
+    },
     patch_args = ["-p1"],
     patches = [
         "//patches:aws-lc-sys_prebuilt.patch",
