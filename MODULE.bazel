@@ -62,7 +62,6 @@ use_repo(rust, "rust_toolchains")
 register_toolchains("@rust_toolchains//:all")
 
 bazel_dep(name = "rules_rs", version = "0.0.23")
-bazel_dep(name = "aws-lc", version = "1.67.0")
 
 crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
 crate.from_cargo(
@@ -76,27 +75,16 @@ crate.annotation(
     version = "0.3.1",
 )
 crate.annotation(
-    build_script_data = [
-        "@aws-lc//:crypto",
-        "@aws-lc//:ssl",
-    ],
     build_script_env = {
         "AWS_LC_SYS_NO_JITTER_ENTROPY": "1",
-        "AWS_LC_SYS_PREBUILT_CRYPTO": "$(rootpaths @aws-lc//:crypto)",
-        "AWS_LC_SYS_PREBUILT_SSL": "$(rootpaths @aws-lc//:ssl)",
+        "AWS_LC_SYS_SKIP_MEMCMP_CHECK": "1",
     },
-    deps = [
-        "@aws-lc//:crypto",
-        "@aws-lc//:ssl",
-    ],
     patch_args = ["-p1"],
     patches = [
-        "//patches:aws-lc-sys_prebuilt.patch",
+        "//patches:aws-lc-sys_skip_memcmp_check.patch",
     ],
     crate = "aws-lc-sys",
 )
-
-inject_repo(crate, "aws-lc")
 
 bazel_dep(name = "openssl", version = "3.5.4.bcr.0")
 
