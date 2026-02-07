@@ -146,6 +146,7 @@ pub(crate) async fn expand_skill_mentions(
     let mut processed_paths = HashSet::new();
     let mut explicit_app_paths = HashSet::new();
     let mut rewritten_contents = HashMap::new();
+    let blocked_plain_names = HashSet::new();
 
     while let Some(skill) = queue.pop_front() {
         if !processed_paths.insert(skill.path.clone()) {
@@ -160,6 +161,7 @@ pub(crate) async fn expand_skill_mentions(
         let selected_before = selected.len();
         select_skills_from_mentions(
             &selection_context,
+            &blocked_plain_names,
             &mentions,
             &mut seen_names,
             &mut seen_paths,
