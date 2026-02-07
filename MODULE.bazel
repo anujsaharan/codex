@@ -16,8 +16,10 @@ osx.framework(name = "CoreGraphics")
 osx.framework(name = "CoreServices")
 osx.framework(name = "CoreText")
 osx.framework(name = "CFNetwork")
+osx.framework(name = "DiskArbitration")
 osx.framework(name = "Foundation")
 osx.framework(name = "ImageIO")
+osx.framework(name = "IOKit")
 osx.framework(name = "Kernel")
 osx.framework(name = "OSLog")
 osx.framework(name = "Security")
@@ -76,22 +78,20 @@ crate.annotation(
     version = "0.3.1",
 )
 crate.annotation(
-    build_script_data_select = {
-        "aarch64-unknown-linux-gnu": ["@aws-lc//:crypto"],
-        "aarch64-apple-darwin": [],
-        "aarch64-pc-windows-gnullvm": [],
-        "x86_64-apple-darwin": [],
-        "x86_64-pc-windows-gnullvm": [],
-        "x86_64-unknown-linux-gnu": ["@aws-lc//:crypto"],
-    },
+    build_script_data = [
+        "@aws-lc//:crypto",
+        "@aws-lc//:ssl",
+    ],
     build_script_env = {
         "AWS_LC_SYS_NO_JITTER_ENTROPY": "1",
+        "AWS_LC_SYS_PREBUILT_CRYPTO": "$(rootpaths @aws-lc//:crypto)",
+        "AWS_LC_SYS_PREBUILT_SSL": "$(rootpaths @aws-lc//:ssl)",
         "AWS_LC_SYS_SKIP_MEMCMP_CHECK": "1",
     },
-    build_script_env_select = {
-        "aarch64-unknown-linux-gnu": "{\"AWS_LC_SYS_PREBUILT_CRYPTO\":\"$(rootpaths @aws-lc//:crypto)\"}",
-        "x86_64-unknown-linux-gnu": "{\"AWS_LC_SYS_PREBUILT_CRYPTO\":\"$(rootpaths @aws-lc//:crypto)\"}",
-    },
+    deps = [
+        "@aws-lc//:crypto",
+        "@aws-lc//:ssl",
+    ],
     patch_args = ["-p1"],
     patches = [
         "//patches:aws-lc-sys_skip_memcmp_check.patch",
