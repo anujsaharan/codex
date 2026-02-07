@@ -1756,12 +1756,7 @@ impl Config {
                 .unwrap_or("https://chatgpt.com/backend-api/".to_string()),
             connectors_mcp_url: cfg
                 .connectors_mcp_url
-<<<<<<< HEAD
-                .map(|url| url.trim())
-                .map(str::to_string)
-=======
                 .map(|url| url.trim().to_string())
->>>>>>> a9bdaae63 (fix(core): trim optional connectors mcp url with closure)
                 .filter(|url| !url.is_empty()),
             forced_chatgpt_workspace_id,
             forced_login_method,
