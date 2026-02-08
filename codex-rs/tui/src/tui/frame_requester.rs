@@ -12,6 +12,10 @@
 //! [“Actors with Tokio”](https://ryhl.io/blog/actors-with-tokio/), with a
 //! dedicated scheduler task and lightweight request handles.
 
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -29,7 +33,31 @@ use super::frame_rate_limiter::FrameRateLimiter;
 /// from anywhere in the TUI code.
 #[derive(Clone, Debug)]
 pub struct FrameRequester {
-    frame_schedule_tx: mpsc::UnboundedSender<Instant>,
+    frame_schedule_tx: mpsc::UnboundedSender<()>,
+    pending: Arc<PendingFrameRequest>,
+}
+
+#[derive(Debug, Default)]
+struct PendingFrameRequest {
+    next_deadline: Mutex<Option<Instant>>,
+    wake_queued: AtomicBool,
+}
+
+impl PendingFrameRequest {
+    fn record_deadline(&self, draw_at: Instant) {
+        let mut guard = self
+            .next_deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(guard.map_or(draw_at, |cur| cur.min(draw_at)));
+    }
+
+    fn take_deadline(&self) -> Option<Instant> {
+        self.next_deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
 }
 
 impl FrameRequester {
@@ -38,21 +66,30 @@ impl FrameRequester {
     /// The provided `draw_tx` is used to notify the TUI event loop of scheduled draws.
     pub fn new(draw_tx: broadcast::Sender<()>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let scheduler = FrameScheduler::new(rx, draw_tx);
+        let pending = Arc::new(PendingFrameRequest::default());
+        let scheduler = FrameScheduler::new(rx, draw_tx, pending.clone());
         tokio::spawn(scheduler.run());
         Self {
             frame_schedule_tx: tx,
+            pending,
         }
     }
 
     /// Schedule a frame draw as soon as possible.
     pub fn schedule_frame(&self) {
-        let _ = self.frame_schedule_tx.send(Instant::now());
+        self.schedule_frame_at(Instant::now());
     }
 
     /// Schedule a frame draw to occur after the specified duration.
     pub fn schedule_frame_in(&self, dur: Duration) {
-        let _ = self.frame_schedule_tx.send(Instant::now() + dur);
+        self.schedule_frame_at(Instant::now() + dur);
+    }
+
+    fn schedule_frame_at(&self, draw_at: Instant) {
+        self.pending.record_deadline(draw_at);
+        if !self.pending.wake_queued.swap(true, Ordering::AcqRel) {
+            let _ = self.frame_schedule_tx.send(());
+        }
     }
 }
 
@@ -63,6 +100,7 @@ impl FrameRequester {
         let (tx, _rx) = mpsc::unbounded_channel();
         FrameRequester {
             frame_schedule_tx: tx,
+            pending: Arc::new(PendingFrameRequest::default()),
         }
     }
 }
@@ -74,17 +112,23 @@ impl FrameRequester {
 /// To avoid wasted redraw work, draw notifications are clamped to a maximum of 120 FPS (see
 /// [`FrameRateLimiter`]).
 struct FrameScheduler {
-    receiver: mpsc::UnboundedReceiver<Instant>,
+    receiver: mpsc::UnboundedReceiver<()>,
     draw_tx: broadcast::Sender<()>,
+    pending: Arc<PendingFrameRequest>,
     rate_limiter: FrameRateLimiter,
 }
 
 impl FrameScheduler {
     /// Create a new FrameScheduler with the provided receiver and draw notification sender.
-    fn new(receiver: mpsc::UnboundedReceiver<Instant>, draw_tx: broadcast::Sender<()>) -> Self {
+    fn new(
+        receiver: mpsc::UnboundedReceiver<()>,
+        draw_tx: broadcast::Sender<()>,
+        pending: Arc<PendingFrameRequest>,
+    ) -> Self {
         Self {
             receiver,
             draw_tx,
+            pending,
             rate_limiter: FrameRateLimiter::default(),
         }
     }
@@ -102,13 +146,16 @@ impl FrameScheduler {
             tokio::pin!(deadline);
 
             tokio::select! {
-                draw_at = self.receiver.recv() => {
-                    let Some(draw_at) = draw_at else {
+                wake = self.receiver.recv() => {
+                    let Some(()) = wake else {
                         // All senders dropped; exit the scheduler.
                         break
                     };
-                    let draw_at = self.rate_limiter.clamp_deadline(draw_at);
-                    next_deadline = Some(next_deadline.map_or(draw_at, |cur| cur.min(draw_at)));
+                    self.pending.wake_queued.store(false, Ordering::Release);
+                    if let Some(draw_at) = self.pending.take_deadline() {
+                        let draw_at = self.rate_limiter.clamp_deadline(draw_at);
+                        next_deadline = Some(next_deadline.map_or(draw_at, |cur| cur.min(draw_at)));
+                    }
 
                     // Do not send a draw immediately here. By continuing the loop,
                     // we recompute the sleep target so the draw fires once via the
