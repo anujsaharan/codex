@@ -1502,6 +1502,15 @@ async fn submit_user_message_with_mode_sets_coding_collaboration_mode() {
     let default_mode = collaboration_modes::default_mode_mask(chat.models_manager.as_ref())
         .expect("expected default collaboration mode");
     chat.submit_user_message_with_mode("Implement the plan.".to_string(), default_mode);
+    assert!(
+        chat.pending_turn_start,
+        "local turn feedback should start before TurnStarted"
+    );
+    assert!(
+        chat.bottom_pane.is_task_running(),
+        "running indicator should be visible during local feedback"
+    );
+    assert_eq!(chat.current_status_header, "Working");
 
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
@@ -1517,6 +1526,12 @@ async fn submit_user_message_with_mode_sets_coding_collaboration_mode() {
             panic!("expected Op::UserTurn with default collab mode, got {other:?}")
         }
     }
+
+    chat.on_task_started();
+    assert!(
+        !chat.pending_turn_start,
+        "TurnStarted should clear local pending state"
+    );
 }
 
 #[tokio::test]
@@ -2177,6 +2192,30 @@ async fn streaming_final_answer_keeps_task_running_state() {
         other => panic!("expected Op::Interrupt, got {other:?}"),
     }
     assert!(!chat.bottom_pane.quit_shortcut_hint_visible());
+}
+
+#[tokio::test]
+async fn stream_preview_cell_is_transient_and_not_inserted_into_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_task_started();
+
+    chat.handle_streaming_delta("partial tail without newline".to_string());
+    assert!(chat.active_cell.as_ref().is_some_and(|cell| {
+        cell.as_any().is::<crate::history_cell::ActiveAgentPreviewCell>()
+    }));
+    let revision_before_flush = chat.active_cell_revision;
+
+    chat.flush_active_cell();
+
+    assert!(chat.active_cell.is_none());
+    assert!(
+        chat.active_cell_revision > revision_before_flush,
+        "dropping preview cell should invalidate transcript live-tail cache"
+    );
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "preview-only cell must not be persisted as history"
+    );
 }
 
 #[tokio::test]
