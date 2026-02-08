@@ -36,6 +36,22 @@ pub struct Originator {
 static ORIGINATOR: LazyLock<RwLock<Option<Originator>>> = LazyLock::new(|| RwLock::new(None));
 static REQUIREMENTS_RESIDENCY: LazyLock<RwLock<Option<ResidencyRequirement>>> =
     LazyLock::new(|| RwLock::new(None));
+static REQWEST_CLIENT_CACHE: LazyLock<RwLock<Option<ReqwestClientCacheEntry>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReqwestClientCacheKey {
+    originator: String,
+    residency: Option<ResidencyRequirement>,
+    user_agent: String,
+    sandboxed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReqwestClientCacheEntry {
+    key: ReqwestClientCacheKey,
+    client: reqwest::Client,
+}
 
 #[derive(Debug)]
 pub enum SetOriginatorError {
@@ -76,6 +92,7 @@ pub fn set_default_originator(value: String) -> Result<(), SetOriginatorError> {
         return Err(SetOriginatorError::AlreadyInitialized);
     }
     *guard = Some(originator);
+    invalidate_reqwest_client_cache();
     Ok(())
 }
 
@@ -85,6 +102,7 @@ pub fn set_default_client_residency_requirement(enforce_residency: Option<Reside
         return;
     };
     *guard = enforce_residency;
+    invalidate_reqwest_client_cache();
 }
 
 pub fn originator() -> Originator {
@@ -179,28 +197,62 @@ pub fn create_client() -> CodexHttpClient {
 }
 
 pub fn build_reqwest_client() -> reqwest::Client {
-    let mut headers = HeaderMap::new();
-    headers.insert("originator", originator().header_value);
-    if let Ok(guard) = REQUIREMENTS_RESIDENCY.read()
-        && let Some(requirement) = guard.as_ref()
-        && !headers.contains_key(RESIDENCY_HEADER_NAME)
+    let key = current_reqwest_client_cache_key();
+    if let Ok(guard) = REQWEST_CLIENT_CACHE.read()
+        && let Some(entry) = guard.as_ref()
+        && entry.key == key
     {
+        return entry.client.clone();
+    }
+
+    let client = build_reqwest_client_for_key(&key);
+    if let Ok(mut guard) = REQWEST_CLIENT_CACHE.write() {
+        *guard = Some(ReqwestClientCacheEntry {
+            key,
+            client: client.clone(),
+        });
+    }
+    client
+}
+
+fn current_reqwest_client_cache_key() -> ReqwestClientCacheKey {
+    let originator = originator();
+    let residency = REQUIREMENTS_RESIDENCY.read().ok().and_then(|guard| *guard);
+    ReqwestClientCacheKey {
+        originator: originator.value,
+        residency,
+        user_agent: get_codex_user_agent(),
+        sandboxed: is_sandboxed(),
+    }
+}
+
+fn build_reqwest_client_for_key(key: &ReqwestClientCacheKey) -> reqwest::Client {
+    let mut headers = HeaderMap::new();
+    let originator_header = HeaderValue::from_str(&key.originator)
+        .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_ORIGINATOR));
+    headers.insert("originator", originator_header);
+    if let Some(requirement) = key.residency {
         let value = match requirement {
             ResidencyRequirement::Us => HeaderValue::from_static("us"),
         };
         headers.insert(RESIDENCY_HEADER_NAME, value);
     }
-    let ua = get_codex_user_agent();
 
     let mut builder = reqwest::Client::builder()
         // Set UA via dedicated helper to avoid header validation pitfalls
-        .user_agent(ua)
+        .user_agent(&key.user_agent)
         .default_headers(headers);
-    if is_sandboxed() {
+    if key.sandboxed {
         builder = builder.no_proxy();
     }
 
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn invalidate_reqwest_client_cache() {
+    if let Ok(mut guard) = REQWEST_CLIENT_CACHE.write() {
+        *guard = None;
+    }
 }
 
 fn is_sandboxed() -> bool {
