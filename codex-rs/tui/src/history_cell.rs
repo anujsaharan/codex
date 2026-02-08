@@ -383,6 +383,52 @@ impl HistoryCell for AgentMessageCell {
 }
 
 #[derive(Debug)]
+pub(crate) struct ActiveAgentPreviewCell {
+    line: String,
+    is_first_line: bool,
+}
+
+impl ActiveAgentPreviewCell {
+    pub(crate) fn new(line: String, is_first_line: bool) -> Self {
+        Self {
+            line,
+            is_first_line,
+        }
+    }
+
+    pub(crate) fn update(&mut self, line: String, is_first_line: bool) {
+        self.line = line;
+        self.is_first_line = is_first_line;
+    }
+}
+
+impl HistoryCell for ActiveAgentPreviewCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        word_wrap_lines(
+            [Line::from(self.line.clone())],
+            RtOptions::new(width as usize)
+                .initial_indent(if self.is_first_line {
+                    "• ".dim().into()
+                } else {
+                    "  ".into()
+                })
+                .subsequent_indent("  ".into()),
+        )
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        !self.is_first_line
+    }
+}
+
+pub(crate) fn new_active_agent_preview(
+    line: String,
+    is_first_line: bool,
+) -> ActiveAgentPreviewCell {
+    ActiveAgentPreviewCell::new(line, is_first_line)
+}
+
+#[derive(Debug)]
 pub(crate) struct PlainHistoryCell {
     lines: Vec<Line<'static>>,
 }
