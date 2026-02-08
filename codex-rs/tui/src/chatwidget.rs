@@ -6569,6 +6569,10 @@ impl ChatWidget {
         self.bottom_pane.composer_is_empty()
     }
 
+    pub(crate) fn is_task_running(&self) -> bool {
+        self.bottom_pane.is_task_running()
+    }
+
     pub(crate) fn submit_user_message_with_mode(
         &mut self,
         text: String,

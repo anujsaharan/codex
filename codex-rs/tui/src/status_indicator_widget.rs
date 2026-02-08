@@ -29,6 +29,10 @@ use crate::wrapping::word_wrap_lines;
 
 const DETAILS_MAX_LINES: usize = 3;
 const DETAILS_PREFIX: &str = "  └ ";
+// Keep spinner animation responsive while avoiding high-frequency redraw pressure
+// during long-running turns.
+const STATUS_ANIMATION_INTERVAL_ANIMATED: Duration = Duration::from_millis(80);
+const STATUS_ANIMATION_INTERVAL_STATIC: Duration = Duration::from_millis(250);
 
 pub(crate) struct StatusIndicatorWidget {
     /// Animated header text (defaults to "Working").
@@ -200,9 +204,13 @@ impl Renderable for StatusIndicatorWidget {
             return;
         }
 
-        // Schedule next animation frame.
-        self.frame_requester
-            .schedule_frame_in(Duration::from_millis(32));
+        // Schedule next refresh tick.
+        let next_refresh = if self.animations_enabled {
+            STATUS_ANIMATION_INTERVAL_ANIMATED
+        } else {
+            STATUS_ANIMATION_INTERVAL_STATIC
+        };
+        self.frame_requester.schedule_frame_in(next_refresh);
         let now = Instant::now();
         let elapsed_duration = self.elapsed_duration_at(now);
         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());

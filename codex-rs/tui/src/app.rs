@@ -103,11 +103,38 @@ use toml::Value as TomlValue;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
+// Drain a bounded number of queued app events per wake to reduce burst latency
+// without starving draw/input handling.
+const APP_EVENT_DRAIN_BUDGET: usize = 256;
+// Drain a bounded number of queued active-thread events per wake to reduce burst latency
+// without starving draw/input handling.
+const ACTIVE_THREAD_DRAIN_BUDGET: usize = 256;
 /// Baseline cadence for periodic stream commit animation ticks.
 ///
 /// Smooth-mode streaming drains one line per tick, so this interval controls
 /// perceived typing speed for non-backlogged output.
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
+
+/// Keep draw height monotonic while work is in flight so transient stream/preview wraps do not
+/// cause the viewport (and input cursor row) to jump up/down every frame.
+fn stabilized_draw_height(
+    draw_height_floor: &mut Option<u16>,
+    desired_height: u16,
+    terminal_height: u16,
+    task_running: bool,
+) -> u16 {
+    let clamped = desired_height.min(terminal_height);
+    if task_running {
+        let floor = draw_height_floor.get_or_insert(clamped);
+        if clamped > *floor {
+            *floor = clamped;
+        }
+        *floor
+    } else {
+        *draw_height_floor = None;
+        clamped
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {
@@ -563,6 +590,7 @@ pub(crate) struct App {
     primary_thread_id: Option<ThreadId>,
     primary_session_configured: Option<SessionConfiguredEvent>,
     pending_primary_events: VecDeque<Event>,
+    draw_height_floor: Option<u16>,
 }
 
 #[derive(Default)]
@@ -875,14 +903,30 @@ impl App {
     }
 
     async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
+        self.drain_active_thread_events_budgeted(tui, usize::MAX)
+            .await
+    }
+
+    async fn drain_active_thread_events_budgeted(
+        &mut self,
+        tui: &mut tui::Tui,
+        max_events: usize,
+    ) -> Result<()> {
         let Some(mut rx) = self.active_thread_rx.take() else {
             return Ok(());
         };
 
         let mut disconnected = false;
+        let mut processed = 0usize;
         loop {
+            if processed >= max_events {
+                break;
+            }
             match rx.try_recv() {
-                Ok(event) => self.handle_codex_event_now(event),
+                Ok(event) => {
+                    self.handle_codex_event_now(event);
+                    processed = processed.saturating_add(1);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -901,6 +945,31 @@ impl App {
             tui.frame_requester().schedule_frame();
         }
         Ok(())
+    }
+
+    async fn drain_app_events_budgeted(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_event_rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+        max_events: usize,
+    ) -> Result<AppRunControl> {
+        let mut processed = 0usize;
+        loop {
+            if processed >= max_events {
+                break;
+            }
+            match app_event_rx.try_recv() {
+                Ok(event) => {
+                    processed = processed.saturating_add(1);
+                    match self.handle_event(tui, event).await? {
+                        AppRunControl::Continue => {}
+                        exit @ AppRunControl::Exit(_) => return Ok(exit),
+                    }
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        Ok(AppRunControl::Continue)
     }
 
     fn replay_thread_snapshot(&mut self, snapshot: ThreadEventSnapshot) {
@@ -1128,6 +1197,7 @@ impl App {
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
+            draw_height_floor: None,
         };
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
@@ -1188,7 +1258,14 @@ impl App {
         let exit_reason = loop {
             let control = select! {
                 Some(event) = app_event_rx.recv() => {
-                    app.handle_event(tui, event).await?
+                    let control = app.handle_event(tui, event).await?;
+                    if matches!(control, AppRunControl::Continue) {
+                        app
+                            .drain_app_events_budgeted(tui, &mut app_event_rx, APP_EVENT_DRAIN_BUDGET)
+                            .await?
+                    } else {
+                        control
+                    }
                 }
                 active = async {
                     if let Some(rx) = app.active_thread_rx.as_mut() {
@@ -1199,6 +1276,9 @@ impl App {
                 }, if app.active_thread_rx.is_some() => {
                     if let Some(event) = active {
                         app.handle_active_thread_event(tui, event)?;
+                        app
+                            .drain_active_thread_events_budgeted(tui, ACTIVE_THREAD_DRAIN_BUDGET)
+                            .await?;
                     } else {
                         app.clear_active_thread().await;
                     }
@@ -1277,15 +1357,19 @@ impl App {
                     {
                         return Ok(AppRunControl::Continue);
                     }
-                    tui.draw(
-                        self.chat_widget.desired_height(tui.terminal.size()?.width),
-                        |frame| {
-                            self.chat_widget.render(frame.area(), frame.buffer);
-                            if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
-                                frame.set_cursor_position((x, y));
-                            }
-                        },
-                    )?;
+                    let terminal_size = tui.terminal.size()?;
+                    let draw_height = stabilized_draw_height(
+                        &mut self.draw_height_floor,
+                        self.chat_widget.desired_height(terminal_size.width),
+                        terminal_size.height,
+                        self.chat_widget.is_task_running(),
+                    );
+                    tui.draw(draw_height, |frame| {
+                        self.chat_widget.render(frame.area(), frame.buffer);
+                        if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
+                            frame.set_cursor_position((x, y));
+                        }
+                    })?;
                     if self.chat_widget.external_editor_state() == ExternalEditorState::Requested {
                         self.chat_widget
                             .set_external_editor_state(ExternalEditorState::Active);
@@ -2634,6 +2718,22 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn stabilized_draw_height_holds_floor_during_running_turn() {
+        let mut floor = None;
+        assert_eq!(stabilized_draw_height(&mut floor, 10, 40, true), 10);
+        assert_eq!(stabilized_draw_height(&mut floor, 8, 40, true), 10);
+        assert_eq!(stabilized_draw_height(&mut floor, 12, 40, true), 12);
+        assert_eq!(floor, Some(12));
+    }
+
+    #[test]
+    fn stabilized_draw_height_resets_floor_after_turn() {
+        let mut floor = Some(18);
+        assert_eq!(stabilized_draw_height(&mut floor, 7, 40, false), 7);
+        assert_eq!(floor, None);
+    }
+
     #[tokio::test]
     async fn enqueue_thread_event_does_not_block_when_channel_full() -> Result<()> {
         let mut app = make_test_app().await;
@@ -2721,6 +2821,7 @@ mod tests {
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
+            draw_height_floor: None,
         }
     }
 
@@ -2775,6 +2876,7 @@ mod tests {
                 primary_thread_id: None,
                 primary_session_configured: None,
                 pending_primary_events: VecDeque::new(),
+                draw_height_floor: None,
             },
             rx,
             op_rx,
