@@ -29,6 +29,15 @@ impl MarkdownStreamCollector {
         self.buffer.push_str(delta);
     }
 
+    /// Returns the current uncommitted trailing text after the most recent newline.
+    ///
+    /// This is intentionally plain text (not markdown-rendered) and is used for
+    /// low-latency preview while waiting for newline-gated stream commits.
+    pub fn pending_tail_text(&self) -> Option<String> {
+        let tail = self.buffer.rsplit('\n').next().unwrap_or_default();
+        (!tail.is_empty()).then(|| tail.to_string())
+    }
+
     /// Render the full buffer and return only the newly completed logical lines
     /// since the last commit. When the buffer does not end with a newline, the
     /// final rendered line is considered incomplete and is not emitted.

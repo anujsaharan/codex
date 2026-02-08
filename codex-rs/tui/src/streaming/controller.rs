@@ -95,6 +95,16 @@ impl StreamController {
         self.state.oldest_queued_age(now)
     }
 
+    /// Returns uncommitted trailing plain text after the latest newline.
+    pub(crate) fn pending_tail_text(&self) -> Option<String> {
+        self.state.collector.pending_tail_text()
+    }
+
+    /// Whether the next emitted streamed line should include the leading bullet.
+    pub(crate) fn next_emit_is_first_line(&self) -> bool {
+        !self.header_emitted
+    }
+
     fn emit(&mut self, lines: Vec<Line<'static>>) -> Option<Box<dyn HistoryCell>> {
         if lines.is_empty() {
             return None;
