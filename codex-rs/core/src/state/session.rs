@@ -1,8 +1,12 @@
 //! Session-wide mutable state.
 
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
@@ -31,6 +35,14 @@ pub(crate) struct SessionState {
     pub(crate) startup_regular_task: Option<RegularTask>,
     pub(crate) active_mcp_tool_selection: Option<Vec<String>>,
     pub(crate) active_connector_selection: HashSet<String>,
+    tool_result_cache: HashMap<String, CachedToolResult>,
+    tool_result_cache_order: VecDeque<String>,
+}
+
+#[derive(Clone)]
+struct CachedToolResult {
+    stored_at: Instant,
+    response: ResponseInputItem,
 }
 
 impl SessionState {
@@ -49,6 +61,8 @@ impl SessionState {
             startup_regular_task: None,
             active_mcp_tool_selection: None,
             active_connector_selection: HashSet::new(),
+            tool_result_cache: HashMap::new(),
+            tool_result_cache_order: VecDeque::new(),
         }
     }
 
@@ -196,6 +210,65 @@ impl SessionState {
     pub(crate) fn clear_connector_selection(&mut self) {
         self.active_connector_selection.clear();
     }
+
+    pub(crate) fn get_cached_tool_result(
+        &mut self,
+        key: &str,
+        max_age: Duration,
+    ) -> Option<ResponseInputItem> {
+        self.evict_expired_tool_results(max_age);
+        self.tool_result_cache
+            .get(key)
+            .map(|entry| entry.response.clone())
+    }
+
+    pub(crate) fn put_cached_tool_result(
+        &mut self,
+        key: String,
+        response: ResponseInputItem,
+        max_entries: usize,
+    ) {
+        if max_entries == 0 {
+            self.tool_result_cache.clear();
+            self.tool_result_cache_order.clear();
+            return;
+        }
+
+        let was_present = self.tool_result_cache.contains_key(&key);
+        self.tool_result_cache.insert(
+            key.clone(),
+            CachedToolResult {
+                stored_at: Instant::now(),
+                response,
+            },
+        );
+
+        if was_present {
+            self.tool_result_cache_order
+                .retain(|existing| existing != &key);
+        }
+        self.tool_result_cache_order.push_back(key);
+
+        while self.tool_result_cache_order.len() > max_entries {
+            if let Some(oldest) = self.tool_result_cache_order.pop_front() {
+                self.tool_result_cache.remove(&oldest);
+            }
+        }
+    }
+
+    fn evict_expired_tool_results(&mut self, max_age: Duration) {
+        if max_age.is_zero() {
+            self.tool_result_cache.clear();
+            self.tool_result_cache_order.clear();
+            return;
+        }
+
+        let now = Instant::now();
+        self.tool_result_cache
+            .retain(|_, entry| now.duration_since(entry.stored_at) <= max_age);
+        self.tool_result_cache_order
+            .retain(|key| self.tool_result_cache.contains_key(key));
+    }
 }
 
 // Sometimes new snapshots don't include credits or plan information.
@@ -222,7 +295,20 @@ mod tests {
     use super::*;
     use crate::codex::make_session_configuration_for_tests;
     use crate::protocol::RateLimitWindow;
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputPayload;
     use pretty_assertions::assert_eq;
+    use std::time::Duration;
+
+    fn sample_tool_result(call_id: &str, output: &str) -> ResponseInputItem {
+        ResponseInputItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text(output.to_string()),
+                success: Some(true),
+            },
+        }
+    }
 
     #[tokio::test]
     async fn merge_mcp_tool_selection_deduplicates_and_preserves_order() {
@@ -441,6 +527,63 @@ mod tests {
                 }),
                 plan_type: Some(codex_protocol::account::PlanType::Plus),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_cache_round_trip_returns_stored_output() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+
+        state.put_cached_tool_result(
+            "weather|98115".to_string(),
+            sample_tool_result("call-1", "ok"),
+            8,
+        );
+
+        assert_eq!(
+            state.get_cached_tool_result("weather|98115", Duration::from_secs(60)),
+            Some(sample_tool_result("call-1", "ok"))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_cache_evicts_oldest_when_capacity_is_exceeded() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+
+        state.put_cached_tool_result("a".to_string(), sample_tool_result("call-a", "A"), 2);
+        state.put_cached_tool_result("b".to_string(), sample_tool_result("call-b", "B"), 2);
+        state.put_cached_tool_result("c".to_string(), sample_tool_result("call-c", "C"), 2);
+
+        assert_eq!(
+            state.get_cached_tool_result("a", Duration::from_secs(60)),
+            None
+        );
+        assert_eq!(
+            state.get_cached_tool_result("b", Duration::from_secs(60)),
+            Some(sample_tool_result("call-b", "B"))
+        );
+        assert_eq!(
+            state.get_cached_tool_result("c", Duration::from_secs(60)),
+            Some(sample_tool_result("call-c", "C"))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_cache_honors_zero_age_as_disabled() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+
+        state.put_cached_tool_result(
+            "weather|98115".to_string(),
+            sample_tool_result("call-1", "ok"),
+            8,
+        );
+
+        assert_eq!(
+            state.get_cached_tool_result("weather|98115", Duration::ZERO),
+            None
         );
     }
 }
