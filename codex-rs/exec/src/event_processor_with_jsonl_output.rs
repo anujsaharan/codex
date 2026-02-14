@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicU64;
 
 use crate::event_processor::CodexStatus;
@@ -49,12 +51,17 @@ use codex_core::protocol::CollabCloseBeginEvent;
 use codex_core::protocol::CollabCloseEndEvent;
 use codex_core::protocol::CollabWaitingBeginEvent;
 use codex_core::protocol::CollabWaitingEndEvent;
+use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use serde_json::Value as JsonValue;
 use tracing::error;
 use tracing::warn;
+
+static FORCE_JSONL_FLUSH: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("CODEX_EXEC_DISABLE_JSONL_FLUSH").is_none());
 
 pub struct EventProcessorWithJsonOutput {
     last_message_path: Option<PathBuf>,
@@ -69,7 +76,9 @@ pub struct EventProcessorWithJsonOutput {
     running_mcp_tool_calls: HashMap<String, RunningMcpToolCall>,
     running_collab_tool_calls: HashMap<String, RunningCollabToolCall>,
     running_web_search_calls: HashMap<String, String>,
+    running_agent_messages: HashMap<String, String>,
     last_critical_error: Option<ThreadErrorEvent>,
+    suppress_next_legacy_agent_message: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +121,9 @@ impl EventProcessorWithJsonOutput {
             running_mcp_tool_calls: HashMap::new(),
             running_collab_tool_calls: HashMap::new(),
             running_web_search_calls: HashMap::new(),
+            running_agent_messages: HashMap::new(),
             last_critical_error: None,
+            suppress_next_legacy_agent_message: false,
         }
     }
 
@@ -120,13 +131,69 @@ impl EventProcessorWithJsonOutput {
         match &event.msg {
             protocol::EventMsg::SessionConfigured(ev) => self.handle_session_configured(ev),
             protocol::EventMsg::ThreadNameUpdated(_) => Vec::new(),
-            protocol::EventMsg::AgentMessage(ev) => self.handle_agent_message(ev),
+            protocol::EventMsg::AgentMessage(ev) => {
+                if self.suppress_next_legacy_agent_message {
+                    self.suppress_next_legacy_agent_message = false;
+                    Vec::new()
+                } else {
+                    self.handle_agent_message(ev)
+                }
+            }
+            protocol::EventMsg::ItemStarted(protocol::ItemStartedEvent {
+                item: TurnItem::AgentMessage(item),
+                ..
+            }) => {
+                let text = text_from_agent_message_item(item);
+                self.running_agent_messages
+                    .insert(item.id.clone(), text.clone());
+                let item = ThreadItem {
+                    id: item.id.clone(),
+                    details: ThreadItemDetails::AgentMessage(AgentMessageItem { text }),
+                };
+                vec![ThreadEvent::ItemStarted(ItemStartedEvent { item })]
+            }
+            protocol::EventMsg::ItemCompleted(protocol::ItemCompletedEvent {
+                item: TurnItem::AgentMessage(item),
+                ..
+            }) => {
+                self.running_agent_messages.remove(&item.id);
+                let text = text_from_agent_message_item(item);
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    self.suppress_next_legacy_agent_message = true;
+                    let item = ThreadItem {
+                        id: item.id.clone(),
+                        details: ThreadItemDetails::AgentMessage(AgentMessageItem { text }),
+                    };
+                    vec![ThreadEvent::ItemCompleted(ItemCompletedEvent { item })]
+                }
+            }
             protocol::EventMsg::ItemCompleted(protocol::ItemCompletedEvent {
                 item: codex_protocol::items::TurnItem::Plan(item),
                 ..
             }) => {
                 self.last_proposed_plan = Some(item.text.clone());
                 Vec::new()
+            }
+            protocol::EventMsg::AgentMessageContentDelta(ev) => {
+                if ev.delta.is_empty() {
+                    Vec::new()
+                } else {
+                    self.suppress_next_legacy_agent_message = true;
+                    self.running_agent_messages
+                        .entry(ev.item_id.clone())
+                        .and_modify(|text| text.push_str(&ev.delta))
+                        .or_insert_with(|| ev.delta.clone());
+                    vec![ThreadEvent::ItemUpdated(ItemUpdatedEvent {
+                        item: ThreadItem {
+                            id: ev.item_id.clone(),
+                            details: ThreadItemDetails::AgentMessage(AgentMessageItem {
+                                text: ev.delta.clone(),
+                            }),
+                        },
+                    })]
+                }
             }
             protocol::EventMsg::AgentReasoning(ev) => self.handle_reasoning_event(ev),
             protocol::EventMsg::ExecCommandBegin(ev) => self.handle_exec_command_begin(ev),
@@ -159,7 +226,11 @@ impl EventProcessorWithJsonOutput {
                 }
                 Vec::new()
             }
-            protocol::EventMsg::TurnStarted(ev) => self.handle_task_started(ev),
+            protocol::EventMsg::TurnStarted(ev) => {
+                self.running_agent_messages.clear();
+                self.suppress_next_legacy_agent_message = false;
+                self.handle_task_started(ev)
+            }
             protocol::EventMsg::TurnComplete(_) => self.handle_task_complete(),
             protocol::EventMsg::Error(ev) => {
                 let error = ThreadErrorEvent {
@@ -746,6 +817,8 @@ impl EventProcessorWithJsonOutput {
 
     fn handle_task_started(&mut self, _: &protocol::TurnStartedEvent) -> Vec<ThreadEvent> {
         self.last_critical_error = None;
+        self.running_agent_messages.clear();
+        self.suppress_next_legacy_agent_message = false;
         vec![ThreadEvent::TurnStarted(TurnStartedEvent {})]
     }
 
@@ -761,6 +834,8 @@ impl EventProcessorWithJsonOutput {
         };
 
         let mut items = Vec::new();
+        self.running_agent_messages.clear();
+        self.suppress_next_legacy_agent_message = false;
 
         if let Some(running) = self.running_todo_list.take() {
             let item = ThreadItem {
@@ -802,6 +877,15 @@ fn is_collab_failure(status: &CoreAgentStatus) -> bool {
         status,
         CoreAgentStatus::Errored(_) | CoreAgentStatus::NotFound
     )
+}
+
+fn text_from_agent_message_item(item: &codex_protocol::items::AgentMessageItem) -> String {
+    item.content
+        .iter()
+        .map(|chunk| match chunk {
+            AgentMessageContent::Text { text } => text.as_str(),
+        })
+        .collect()
 }
 
 impl From<CoreAgentStatus> for CollabAgentState {
@@ -846,14 +930,25 @@ impl EventProcessor for EventProcessorWithJsonOutput {
     #[allow(clippy::print_stdout)]
     fn process_event(&mut self, event: protocol::Event) -> CodexStatus {
         let aggregated = self.collect_thread_events(&event);
-        for conv_event in aggregated {
-            match serde_json::to_string(&conv_event) {
-                Ok(line) => {
-                    println!("{line}");
+        if !aggregated.is_empty() {
+            let mut output = String::new();
+            let mut stdout = std::io::stdout().lock();
+            for conv_event in aggregated {
+                match serde_json::to_string(&conv_event) {
+                    Ok(line) => {
+                        output.push_str(&line);
+                        output.push('\n');
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize event: {e:?}");
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to serialize event: {e:?}");
-                }
+            }
+            if let Err(err) = stdout.write_all(output.as_bytes()) {
+                error!("Failed to write event: {err}");
+            }
+            if *FORCE_JSONL_FLUSH && let Err(err) = stdout.flush() {
+                error!("Failed to flush stdout: {err}");
             }
         }
 
