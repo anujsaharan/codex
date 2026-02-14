@@ -72,6 +72,7 @@ Baseline emulated:
 1. Synthetic token-stream metrics were close between variants.
 2. The biggest real-world perceived win likely came from core duplicate-work elimination (cache + single-flight + MCP list reuse), which synthetic harnesses only partially stress.
 3. Tradeoff accepted: bounded staleness window for repeated external read tools.
+4. Post-review cleanup commits removed dead state and unnecessary key computation; these are behavior-preserving hygiene changes, not new tuning knobs.
 
 ## Validation Commands Run On Final Tracked Code
 
@@ -80,4 +81,3 @@ Baseline emulated:
 3. `cargo test -p codex-tui background_event_normalizes_machine_payloads -- --nocapture`
 4. `pnpm -C sdk/typescript test -- exec.test.ts`
 5. `pnpm -C sdk/typescript build`
-

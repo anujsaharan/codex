@@ -40,9 +40,8 @@ This update aligns output behavior with incremental turn-item semantics and redu
 
 ## Costs / Tradeoffs
 
-1. Additional internal state (`running_agent_messages`) increases complexity.
-2. Ordering assumptions between item events and legacy events must stay valid.
-3. If protocol evolves, suppression logic may need updates to avoid accidental drops/dupes.
+1. Ordering assumptions between item events and legacy events must stay valid.
+2. If protocol evolves, suppression logic may need updates to avoid accidental drops/dupes.
 
 ## Interaction With Existing Code
 
@@ -70,3 +69,8 @@ Shoe-horned:
 1. `cargo test -p codex-exec --quiet`
 2. Full integration checks indirectly via TUI/SDK tests in later PRs.
 
+## Post-Review Cleanup Delta
+
+1. Removed `running_agent_messages` map as dead state (it was not used for emission decisions).
+2. Removed duplicate reset calls that overlapped with `handle_task_started`.
+3. Reduced line count and state surface while preserving event output behavior.

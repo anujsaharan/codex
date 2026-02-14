@@ -50,6 +50,8 @@ Given existing architecture, caching at `ToolCallRuntime` is the highest leverag
    Result: lower provider/tool load and lower tail latency under parallel tool fanout.
 4. MCP tool listing reused in-turn.
    Result: one less `list_all_tools()` call per turn in affected flows.
+5. Cache key generation now happens only for cache-eligible tools.
+   Result: avoids canonicalization overhead on non-cacheable tool calls.
 
 ## Costs / Tradeoffs
 
@@ -86,3 +88,8 @@ Native:
 2. Focused cache tests in `session.rs` and `parallel.rs`.
 3. Whole-repo follow-up tests via downstream PRs (exec/tui/sdk) to ensure no protocol regressions.
 
+## Post-Review Cleanup Delta
+
+1. Removed unnecessary cache-key computation for non-cacheable calls.
+2. Added concise comments for single-flight/cache fast path to reduce maintainer cognitive load.
+3. Kept behavior identical for cacheable flows; all core tests remained green.
