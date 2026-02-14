@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::LazyLock;
 use std::sync::atomic::AtomicU64;
 
 use crate::event_processor::CodexStatus;
@@ -59,9 +58,6 @@ use codex_protocol::plan_tool::UpdatePlanArgs;
 use serde_json::Value as JsonValue;
 use tracing::error;
 use tracing::warn;
-
-static FORCE_JSONL_FLUSH: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("CODEX_EXEC_DISABLE_JSONL_FLUSH").is_none());
 
 pub struct EventProcessorWithJsonOutput {
     last_message_path: Option<PathBuf>,
@@ -947,7 +943,7 @@ impl EventProcessor for EventProcessorWithJsonOutput {
             if let Err(err) = stdout.write_all(output.as_bytes()) {
                 error!("Failed to write event: {err}");
             }
-            if *FORCE_JSONL_FLUSH && let Err(err) = stdout.flush() {
+            if let Err(err) = stdout.flush() {
                 error!("Failed to flush stdout: {err}");
             }
         }

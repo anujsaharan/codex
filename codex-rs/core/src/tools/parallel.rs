@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -28,20 +27,8 @@ use codex_protocol::models::ResponseInputItem;
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 
-static TOOL_RESULT_CACHE_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("CODEX_PERF_DISABLE_TOOL_RESULT_CACHE").is_none());
-static TOOL_RESULT_CACHE_MAX_ENTRIES: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("CODEX_PERF_TOOL_RESULT_CACHE_MAX_ENTRIES")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(64)
-});
-static TOOL_RESULT_CACHE_TTL_SECS: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("CODEX_PERF_TOOL_RESULT_CACHE_TTL_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(120)
-});
+const TOOL_RESULT_CACHE_MAX_ENTRIES: usize = 64;
+const TOOL_RESULT_CACHE_TTL_SECS: u64 = 120;
 
 #[derive(Clone)]
 pub(crate) struct ToolCallRuntime {
@@ -91,7 +78,7 @@ impl ToolCallRuntime {
         let cache_key = tool_call_cache_key(&call);
         let supports_turn_cache = tool_supports_turn_cache(&call.tool_name);
         let supports_session_cache = tool_supports_session_cache(&call.tool_name);
-        let tool_cache_ttl = Duration::from_secs(*TOOL_RESULT_CACHE_TTL_SECS);
+        let tool_cache_ttl = Duration::from_secs(TOOL_RESULT_CACHE_TTL_SECS);
 
         let dispatch_span = trace_span!(
             "dispatch_tool_call",
@@ -117,7 +104,6 @@ impl ToolCallRuntime {
                     return Ok(remap_response_call_id(cached, &call.call_id));
                 }
                 if supports_session_cache
-                    && *TOOL_RESULT_CACHE_ENABLED
                     && let Some(cached) = session
                         .get_cached_tool_result(&cache_key, tool_cache_ttl)
                         .await
@@ -213,12 +199,12 @@ impl ToolCallRuntime {
                                     .await
                                     .insert(cache_key.clone(), response.clone());
                             }
-                            if supports_session_cache && *TOOL_RESULT_CACHE_ENABLED {
+                            if supports_session_cache {
                                 session
                                     .put_cached_tool_result(
                                         cache_key.clone(),
                                         response.clone(),
-                                        *TOOL_RESULT_CACHE_MAX_ENTRIES,
+                                        TOOL_RESULT_CACHE_MAX_ENTRIES,
                                     )
                                     .await;
                             }
@@ -311,16 +297,7 @@ fn tool_supports_turn_cache(tool_name: &str) -> bool {
 fn tool_supports_session_cache(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "search_query"
-            | "image_query"
-            | "weather"
-            | "sports"
-            | "finance"
-            | "time"
-            | "list_mcp_resources"
-            | "list_mcp_resource_templates"
-            | "read_mcp_resource"
-            | "search_tool_bm25"
+        "search_query" | "image_query" | "weather" | "sports" | "finance" | "time"
     )
 }
 
