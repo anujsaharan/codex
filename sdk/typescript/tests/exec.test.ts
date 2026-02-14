@@ -93,4 +93,27 @@ describe("CodexExec", () => {
     expect(imageIndex).toBeGreaterThan(-1);
     expect(resumeIndex).toBeLessThan(imageIndex);
   });
+
+  it("parses chunked stdout lines with the default stream parser", async () => {
+    const { CodexExec } = await import("../src/exec");
+    spawnMock.mockClear();
+    const child = new FakeChildProcess();
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+
+    setImmediate(() => {
+      child.stdout.write('{"type":"turn.started"}\n{"type":"item.updated"');
+      child.stdout.write('}\n');
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("exit", 0, null);
+    });
+
+    const exec = new CodexExec("codex");
+    const lines: string[] = [];
+    for await (const line of exec.run({ input: "hi" })) {
+      lines.push(line);
+    }
+
+    expect(lines).toEqual(['{"type":"turn.started"}', '{"type":"item.updated"}']);
+  });
 });
