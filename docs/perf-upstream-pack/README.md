@@ -9,7 +9,7 @@ This document set is the PR metadata bundle you asked for:
 - what may break
 - validation/ablation results
 
-These docs are written against the code currently on this fork's `main` as of commit `accf266d2`.
+These docs are written against the code currently on this fork's `main` as of commit `b7f24d152`.
 
 ## Scope In Main
 

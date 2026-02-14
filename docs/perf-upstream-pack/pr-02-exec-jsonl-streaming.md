@@ -1,7 +1,7 @@
 # PR 02: `codex-exec` JSONL Streaming and Delta Handling
 
 Branch: `upstream-pr/02-exec-jsonl-streaming`  
-Commit: `12a246f53`  
+Commit: `4afac5db1`  
 Compare: <https://github.com/openai/codex/compare/main...anujsaharan:upstream-pr/02-exec-jsonl-streaming>
 
 ## What Changed

@@ -1,7 +1,7 @@
 # PR 01: Core Tool Cache + Event Pipeline Fast Path
 
 Branch: `upstream-pr/01-core-tool-cache-event-pipeline`  
-Commit: `1ecee3ce2`  
+Commit: `ada81ffdf`  
 Compare: <https://github.com/openai/codex/compare/main...anujsaharan:upstream-pr/01-core-tool-cache-event-pipeline>
 
 ## What Changed
