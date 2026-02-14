@@ -6232,6 +6232,22 @@ async fn background_event_updates_status_header() {
 }
 
 #[tokio::test]
+async fn background_event_normalizes_machine_payloads() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "bg-2".into(),
+        msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
+            message: r#"{"server":"search-mcp","status":"ready"}"#.to_string(),
+        }),
+    });
+
+    assert!(chat.bottom_pane.status_indicator_visible());
+    assert_eq!(chat.current_status_header, "MCP server search-mcp: ready");
+    assert!(drain_insert_history(&mut rx).is_empty());
+}
+
+#[tokio::test]
 async fn apply_patch_events_emit_history_cells() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
