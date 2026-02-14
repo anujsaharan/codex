@@ -146,6 +146,7 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
+use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -864,14 +865,79 @@ impl ChatWidget {
     ///
     /// Passing `None` clears any existing details.
     fn set_status(&mut self, header: String, details: Option<String>) {
-        self.current_status_header = header.clone();
-        self.bottom_pane.update_status(header, details);
+        let normalized_header = Self::normalize_status_header(&header);
+        self.current_status_header = normalized_header.clone();
+        self.bottom_pane.update_status(normalized_header, details);
     }
 
     /// Convenience wrapper around [`Self::set_status`];
     /// updates the status indicator header and clears any existing details.
     fn set_status_header(&mut self, header: String) {
         self.set_status(header, None);
+    }
+
+    fn normalize_status_header(raw_header: &str) -> String {
+        let compact = Self::compact_whitespace(raw_header);
+        if compact.is_empty() {
+            return "Working".to_string();
+        }
+
+        let lower = compact.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "streaming response."
+                | "streaming response"
+                | "assistant"
+                | "assistant response"
+                | "assistant reply"
+        ) {
+            return "Model response".to_string();
+        }
+
+        if let Ok(value) = serde_json::from_str::<Value>(&compact) {
+            if let Some(summary) = Self::normalize_status_json_message(&value) {
+                return summary;
+            }
+            return "System update".to_string();
+        }
+
+        compact
+    }
+
+    fn normalize_status_json_message(value: &Value) -> Option<String> {
+        if let Some(text) = value.as_str() {
+            return Some(Self::compact_whitespace(text));
+        }
+
+        let object = value.as_object()?;
+
+        if let Some(message) = object.get("message").and_then(Value::as_str) {
+            return Some(Self::compact_whitespace(message));
+        }
+        if let Some(status) = object.get("status").and_then(Value::as_str) {
+            if let Some(server) = object.get("server").and_then(Value::as_str) {
+                return Some(format!("MCP server {server}: {status}"));
+            }
+            if let Some(tool) = object.get("tool").and_then(Value::as_str) {
+                return Some(format!("Tool {tool}: {status}"));
+            }
+            if let Some(tool) = object.get("tool_name").and_then(Value::as_str) {
+                return Some(format!("Tool {tool}: {status}"));
+            }
+            return Some(Self::compact_whitespace(status));
+        }
+        if let Some(text) = object.get("text").and_then(Value::as_str) {
+            return Some(Self::compact_whitespace(text));
+        }
+        if let Some(text) = object.get("event").and_then(Value::as_str) {
+            return Some(Self::compact_whitespace(text));
+        }
+
+        None
+    }
+
+    fn compact_whitespace(raw: &str) -> String {
+        raw.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// Sets the currently rendered footer status-line value.
