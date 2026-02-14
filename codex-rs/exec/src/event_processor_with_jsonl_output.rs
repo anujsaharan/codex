@@ -76,7 +76,6 @@ pub struct EventProcessorWithJsonOutput {
     running_mcp_tool_calls: HashMap<String, RunningMcpToolCall>,
     running_collab_tool_calls: HashMap<String, RunningCollabToolCall>,
     running_web_search_calls: HashMap<String, String>,
-    running_agent_messages: HashMap<String, String>,
     last_critical_error: Option<ThreadErrorEvent>,
     suppress_next_legacy_agent_message: bool,
 }
@@ -121,7 +120,6 @@ impl EventProcessorWithJsonOutput {
             running_mcp_tool_calls: HashMap::new(),
             running_collab_tool_calls: HashMap::new(),
             running_web_search_calls: HashMap::new(),
-            running_agent_messages: HashMap::new(),
             last_critical_error: None,
             suppress_next_legacy_agent_message: false,
         }
@@ -144,8 +142,6 @@ impl EventProcessorWithJsonOutput {
                 ..
             }) => {
                 let text = text_from_agent_message_item(item);
-                self.running_agent_messages
-                    .insert(item.id.clone(), text.clone());
                 let item = ThreadItem {
                     id: item.id.clone(),
                     details: ThreadItemDetails::AgentMessage(AgentMessageItem { text }),
@@ -156,7 +152,6 @@ impl EventProcessorWithJsonOutput {
                 item: TurnItem::AgentMessage(item),
                 ..
             }) => {
-                self.running_agent_messages.remove(&item.id);
                 let text = text_from_agent_message_item(item);
                 if text.is_empty() {
                     Vec::new()
@@ -181,10 +176,6 @@ impl EventProcessorWithJsonOutput {
                     Vec::new()
                 } else {
                     self.suppress_next_legacy_agent_message = true;
-                    self.running_agent_messages
-                        .entry(ev.item_id.clone())
-                        .and_modify(|text| text.push_str(&ev.delta))
-                        .or_insert_with(|| ev.delta.clone());
                     vec![ThreadEvent::ItemUpdated(ItemUpdatedEvent {
                         item: ThreadItem {
                             id: ev.item_id.clone(),
@@ -226,11 +217,7 @@ impl EventProcessorWithJsonOutput {
                 }
                 Vec::new()
             }
-            protocol::EventMsg::TurnStarted(ev) => {
-                self.running_agent_messages.clear();
-                self.suppress_next_legacy_agent_message = false;
-                self.handle_task_started(ev)
-            }
+            protocol::EventMsg::TurnStarted(ev) => self.handle_task_started(ev),
             protocol::EventMsg::TurnComplete(_) => self.handle_task_complete(),
             protocol::EventMsg::Error(ev) => {
                 let error = ThreadErrorEvent {
@@ -817,7 +804,6 @@ impl EventProcessorWithJsonOutput {
 
     fn handle_task_started(&mut self, _: &protocol::TurnStartedEvent) -> Vec<ThreadEvent> {
         self.last_critical_error = None;
-        self.running_agent_messages.clear();
         self.suppress_next_legacy_agent_message = false;
         vec![ThreadEvent::TurnStarted(TurnStartedEvent {})]
     }
@@ -834,7 +820,6 @@ impl EventProcessorWithJsonOutput {
         };
 
         let mut items = Vec::new();
-        self.running_agent_messages.clear();
         self.suppress_next_legacy_agent_message = false;
 
         if let Some(running) = self.running_todo_list.take() {
