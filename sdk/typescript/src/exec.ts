@@ -192,15 +192,50 @@ export class CodexExec {
       },
     );
 
-    const rl = readline.createInterface({
-      input: child.stdout,
-      crlfDelay: Infinity,
-    });
-
+    const parserMode = (env.CODEX_SDK_STREAM_PARSER || "").toLowerCase();
+    let stdoutBuffer = "";
     try {
-      for await (const line of rl) {
-        // `line` is a string (Node sets default encoding to utf8 for readline)
-        yield line as string;
+      if (parserMode === "readline") {
+        const rl = readline.createInterface({
+          input: child.stdout,
+          crlfDelay: Infinity,
+        });
+        try {
+          for await (const line of rl) {
+            if (line.length > 0) {
+              yield line as string;
+            }
+          }
+        } finally {
+          rl.close();
+        }
+      } else {
+        for await (const chunk of child.stdout) {
+          const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+          stdoutBuffer += text;
+
+          let newlineIndex = stdoutBuffer.indexOf("\n");
+          while (newlineIndex !== -1) {
+            let line = stdoutBuffer.slice(0, newlineIndex);
+            stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+            if (line.endsWith("\r")) {
+              line = line.slice(0, -1);
+            }
+            if (line.length > 0) {
+              yield line;
+            }
+            newlineIndex = stdoutBuffer.indexOf("\n");
+          }
+        }
+
+        if (stdoutBuffer.length > 0) {
+          const trailing = stdoutBuffer.endsWith("\r")
+            ? stdoutBuffer.slice(0, -1)
+            : stdoutBuffer;
+          if (trailing.length > 0) {
+            yield trailing;
+          }
+        }
       }
 
       if (spawnError) throw spawnError;
@@ -211,7 +246,6 @@ export class CodexExec {
         throw new Error(`Codex Exec exited with ${detail}: ${stderrBuffer.toString("utf8")}`);
       }
     } finally {
-      rl.close();
       child.removeAllListeners();
       try {
         if (!child.killed) child.kill();
