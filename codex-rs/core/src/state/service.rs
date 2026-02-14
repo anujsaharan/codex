@@ -10,6 +10,7 @@ use crate::exec_policy::ExecPolicyManager;
 use crate::file_watcher::FileWatcher;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::models_manager::manager::ModelsManager;
+use crate::rollout::policy::EventPersistenceMode;
 use crate::skills::SkillsManager;
 use crate::state_db::StateDbHandle;
 use crate::tools::network_approval::NetworkApprovalService;
@@ -28,6 +29,7 @@ pub(crate) struct SessionServices {
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) hooks: Hooks,
+    pub(crate) rollout_event_persistence_mode: EventPersistenceMode,
     pub(crate) rollout: Mutex<Option<RolloutRecorder>>,
     pub(crate) user_shell: Arc<crate::shell::Shell>,
     pub(crate) shell_snapshot_tx: watch::Sender<Option<Arc<crate::shell_snapshot::ShellSnapshot>>>,
