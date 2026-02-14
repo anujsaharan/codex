@@ -2120,7 +2120,7 @@ impl Session {
 
     async fn send_event_to_subscribers(&self, event: Event) {
         if let Err(e) = self.tx_event.try_send(event) {
-            debug!("dropping event because channel is closed: {e}");
+            debug!("dropping event because subscriber channel is unavailable: {e}");
         }
     }
 
