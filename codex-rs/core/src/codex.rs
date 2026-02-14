@@ -4,7 +4,6 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::AtomicU64;
 
 use crate::AuthManager;
@@ -278,14 +277,6 @@ pub struct CodexSpawnOk {
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 64;
-static PERF_DISABLE_EVENT_PERSIST_FASTPATH: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("CODEX_PERF_DISABLE_EVENT_PERSIST_FASTPATH").is_some());
-static PERF_BLOCKING_EVENT_SEND: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("CODEX_PERF_BLOCKING_EVENT_SEND").is_some());
-static PERF_PERSIST_BEFORE_EVENT_SEND: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("CODEX_PERF_PERSIST_BEFORE_EVENT_SEND").is_some());
-static PERF_FORCE_PERSIST_ALL_EVENTS: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("CODEX_PERF_FORCE_PERSIST_ALL_EVENTS").is_some());
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
@@ -2101,21 +2092,13 @@ impl Session {
         if let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
         }
-        let rollout_item = (*PERF_FORCE_PERSIST_ALL_EVENTS
-            || *PERF_DISABLE_EVENT_PERSIST_FASTPATH
-            || should_persist_event_msg(&event.msg, self.services.rollout_event_persistence_mode))
-        .then(|| RolloutItem::EventMsg(event.msg.clone()));
+        let rollout_item =
+            should_persist_event_msg(&event.msg, self.services.rollout_event_persistence_mode)
+                .then(|| RolloutItem::EventMsg(event.msg.clone()));
 
-        if *PERF_PERSIST_BEFORE_EVENT_SEND {
-            if let Some(item) = rollout_item.as_ref() {
-                self.persist_rollout_items(std::slice::from_ref(item)).await;
-            }
-            self.send_event_to_subscribers(event).await;
-        } else {
-            self.send_event_to_subscribers(event).await;
-            if let Some(item) = rollout_item.as_ref() {
-                self.persist_rollout_items(std::slice::from_ref(item)).await;
-            }
+        self.send_event_to_subscribers(event).await;
+        if let Some(item) = rollout_item.as_ref() {
+            self.persist_rollout_items(std::slice::from_ref(item)).await;
         }
     }
 
@@ -2136,12 +2119,8 @@ impl Session {
     }
 
     async fn send_event_to_subscribers(&self, event: Event) {
-        if *PERF_BLOCKING_EVENT_SEND {
-            if let Err(e) = self.tx_event.send(event).await {
-                debug!("dropping event because channel is closed: {e}");
-            }
-        } else if let Err(e) = self.tx_event.try_send(event) {
-            debug!("dropping event because channel is closed: {e}");
+        if let Err(e) = self.tx_event.try_send(event) {
+            debug!("dropping event because subscriber channel is unavailable: {e}");
         }
     }
 

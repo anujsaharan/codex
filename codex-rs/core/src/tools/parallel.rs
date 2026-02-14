@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -28,20 +27,8 @@ use codex_protocol::models::ResponseInputItem;
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 
-static TOOL_RESULT_CACHE_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("CODEX_PERF_DISABLE_TOOL_RESULT_CACHE").is_none());
-static TOOL_RESULT_CACHE_MAX_ENTRIES: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("CODEX_PERF_TOOL_RESULT_CACHE_MAX_ENTRIES")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(64)
-});
-static TOOL_RESULT_CACHE_TTL_SECS: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("CODEX_PERF_TOOL_RESULT_CACHE_TTL_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(120)
-});
+const TOOL_RESULT_CACHE_MAX_ENTRIES: usize = 64;
+const TOOL_RESULT_CACHE_TTL_SECS: u64 = 120;
 
 #[derive(Clone)]
 pub(crate) struct ToolCallRuntime {
@@ -88,10 +75,11 @@ impl ToolCallRuntime {
         let turn_result_cache = Arc::clone(&self.turn_result_cache);
         let turn_inflight_cache = Arc::clone(&self.turn_inflight_cache);
         let started = Instant::now();
-        let cache_key = tool_call_cache_key(&call);
         let supports_turn_cache = tool_supports_turn_cache(&call.tool_name);
         let supports_session_cache = tool_supports_session_cache(&call.tool_name);
-        let tool_cache_ttl = Duration::from_secs(*TOOL_RESULT_CACHE_TTL_SECS);
+        let cache_key =
+            (supports_turn_cache || supports_session_cache).then(|| tool_call_cache_key(&call));
+        let tool_cache_ttl = Duration::from_secs(TOOL_RESULT_CACHE_TTL_SECS);
 
         let dispatch_span = trace_span!(
             "dispatch_tool_call",
@@ -106,8 +94,10 @@ impl ToolCallRuntime {
                 let mut shared_result_sender: Option<watch::Sender<Option<ResponseInputItem>>> =
                     None;
 
+                // Fast path: return an already-computed result without dispatching the tool.
                 if supports_turn_cache
-                    && let Some(cached) = turn_result_cache.lock().await.get(&cache_key).cloned()
+                    && let Some(cache_key) = cache_key.as_ref()
+                    && let Some(cached) = turn_result_cache.lock().await.get(cache_key).cloned()
                 {
                     tracing::debug!(
                         tool_name = %call.tool_name,
@@ -117,9 +107,9 @@ impl ToolCallRuntime {
                     return Ok(remap_response_call_id(cached, &call.call_id));
                 }
                 if supports_session_cache
-                    && *TOOL_RESULT_CACHE_ENABLED
+                    && let Some(cache_key) = cache_key.as_ref()
                     && let Some(cached) = session
-                        .get_cached_tool_result(&cache_key, tool_cache_ttl)
+                        .get_cached_tool_result(cache_key, tool_cache_ttl)
                         .await
                 {
                     tracing::debug!(
@@ -137,43 +127,46 @@ impl ToolCallRuntime {
                 }
 
                 if supports_turn_cache {
-                    let mut waiting_on_existing: Option<
-                        watch::Receiver<Option<ResponseInputItem>>,
-                    > = None;
-                    {
-                        let mut inflight = turn_inflight_cache.lock().await;
-                        if let Some(existing) = inflight.get(&cache_key) {
-                            waiting_on_existing = Some(existing.clone());
-                        } else {
-                            let (sender, receiver) = watch::channel(None::<ResponseInputItem>);
-                            inflight.insert(cache_key.clone(), receiver);
-                            shared_result_sender = Some(sender);
-                        }
-                    }
-
-                    if let Some(mut receiver) = waiting_on_existing {
-                        tracing::debug!(
-                            tool_name = %call.tool_name,
-                            call_id = %call.call_id,
-                            "waiting for in-flight tool result"
-                        );
-
-                        tokio::select! {
-                            _ = cancellation_token.cancelled() => {
-                                let secs = started.elapsed().as_secs_f32().max(0.1);
-                                dispatch_span.record("aborted", true);
-                                return Ok(Self::aborted_response(&call, secs));
-                            }
-                            _ = receiver.changed() => {}
-                        }
-
-                        if let Some(cached) = receiver.borrow().clone() {
-                            return Ok(remap_response_call_id(cached, &call.call_id));
-                        }
-                        if let Some(cached) =
-                            turn_result_cache.lock().await.get(&cache_key).cloned()
+                    if let Some(cache_key) = cache_key.as_ref() {
+                        // Single-flight per turn/cache key: at most one dispatch computes a value.
+                        let mut waiting_on_existing: Option<
+                            watch::Receiver<Option<ResponseInputItem>>,
+                        > = None;
                         {
-                            return Ok(remap_response_call_id(cached, &call.call_id));
+                            let mut inflight = turn_inflight_cache.lock().await;
+                            if let Some(existing) = inflight.get(cache_key) {
+                                waiting_on_existing = Some(existing.clone());
+                            } else {
+                                let (sender, receiver) = watch::channel(None::<ResponseInputItem>);
+                                inflight.insert(cache_key.clone(), receiver);
+                                shared_result_sender = Some(sender);
+                            }
+                        }
+
+                        if let Some(mut receiver) = waiting_on_existing {
+                            tracing::debug!(
+                                tool_name = %call.tool_name,
+                                call_id = %call.call_id,
+                                "waiting for in-flight tool result"
+                            );
+
+                            tokio::select! {
+                                _ = cancellation_token.cancelled() => {
+                                    let secs = started.elapsed().as_secs_f32().max(0.1);
+                                    dispatch_span.record("aborted", true);
+                                    return Ok(Self::aborted_response(&call, secs));
+                                }
+                                _ = receiver.changed() => {}
+                            }
+
+                            if let Some(cached) = receiver.borrow().clone() {
+                                return Ok(remap_response_call_id(cached, &call.call_id));
+                            }
+                            if let Some(cached) =
+                                turn_result_cache.lock().await.get(cache_key).cloned()
+                            {
+                                return Ok(remap_response_call_id(cached, &call.call_id));
+                            }
                         }
                     }
                 }
@@ -208,19 +201,23 @@ impl ToolCallRuntime {
                             && should_cache_tool_response(response)
                         {
                             if supports_turn_cache {
-                                turn_result_cache
-                                    .lock()
-                                    .await
-                                    .insert(cache_key.clone(), response.clone());
+                                if let Some(cache_key) = cache_key.as_ref() {
+                                    turn_result_cache
+                                        .lock()
+                                        .await
+                                        .insert(cache_key.clone(), response.clone());
+                                }
                             }
-                            if supports_session_cache && *TOOL_RESULT_CACHE_ENABLED {
-                                session
-                                    .put_cached_tool_result(
-                                        cache_key.clone(),
-                                        response.clone(),
-                                        *TOOL_RESULT_CACHE_MAX_ENTRIES,
-                                    )
-                                    .await;
+                            if supports_session_cache {
+                                if let Some(cache_key) = cache_key.as_ref() {
+                                    session
+                                        .put_cached_tool_result(
+                                            cache_key.clone(),
+                                            response.clone(),
+                                            TOOL_RESULT_CACHE_MAX_ENTRIES,
+                                        )
+                                        .await;
+                                }
                             }
                         }
 
@@ -237,7 +234,9 @@ impl ToolCallRuntime {
                         })
                     };
                     let _ = sender.send(shareable);
-                    turn_inflight_cache.lock().await.remove(&cache_key);
+                    if let Some(cache_key) = cache_key.as_ref() {
+                        turn_inflight_cache.lock().await.remove(cache_key);
+                    }
                 }
 
                 result
@@ -311,16 +310,7 @@ fn tool_supports_turn_cache(tool_name: &str) -> bool {
 fn tool_supports_session_cache(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "search_query"
-            | "image_query"
-            | "weather"
-            | "sports"
-            | "finance"
-            | "time"
-            | "list_mcp_resources"
-            | "list_mcp_resource_templates"
-            | "read_mcp_resource"
-            | "search_tool_bm25"
+        "search_query" | "image_query" | "weather" | "sports" | "finance" | "time"
     )
 }
 
