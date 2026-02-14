@@ -198,6 +198,7 @@ use crate::rollout::RolloutRecorderParams;
 use crate::rollout::map_session_init_error;
 use crate::rollout::metadata;
 use crate::rollout::policy::EventPersistenceMode;
+use crate::rollout::policy::should_persist_event_msg;
 use crate::shell;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
@@ -1012,6 +1013,12 @@ impl Session {
 
         let forked_from_id = initial_history.forked_from_id();
 
+        let rollout_event_persistence_mode = if session_configuration.persist_extended_history {
+            EventPersistenceMode::Extended
+        } else {
+            EventPersistenceMode::Limited
+        };
+
         let (conversation_id, rollout_params) = match &initial_history {
             InitialHistory::New | InitialHistory::Forked(_) => {
                 let conversation_id = ThreadId::default();
@@ -1025,11 +1032,7 @@ impl Session {
                             text: session_configuration.base_instructions.clone(),
                         },
                         session_configuration.dynamic_tools.clone(),
-                        if session_configuration.persist_extended_history {
-                            EventPersistenceMode::Extended
-                        } else {
-                            EventPersistenceMode::Limited
-                        },
+                        rollout_event_persistence_mode,
                     ),
                 )
             }
@@ -1037,11 +1040,7 @@ impl Session {
                 resumed_history.conversation_id,
                 RolloutRecorderParams::resume(
                     resumed_history.rollout_path.clone(),
-                    if session_configuration.persist_extended_history {
-                        EventPersistenceMode::Extended
-                    } else {
-                        EventPersistenceMode::Limited
-                    },
+                    rollout_event_persistence_mode,
                 ),
             ),
         };
@@ -1267,6 +1266,7 @@ impl Session {
             hooks: Hooks::new(HooksConfig {
                 legacy_notify_argv: config.notify.clone(),
             }),
+            rollout_event_persistence_mode,
             rollout: Mutex::new(rollout_recorder),
             user_shell: Arc::new(default_shell),
             shell_snapshot_tx,
@@ -1518,6 +1518,25 @@ impl Session {
     pub(crate) async fn clear_connector_selection(&self) {
         let mut state = self.state.lock().await;
         state.clear_connector_selection();
+    }
+
+    pub(crate) async fn get_cached_tool_result(
+        &self,
+        key: &str,
+        max_age: std::time::Duration,
+    ) -> Option<ResponseInputItem> {
+        let mut state = self.state.lock().await;
+        state.get_cached_tool_result(key, max_age)
+    }
+
+    pub(crate) async fn put_cached_tool_result(
+        &self,
+        key: String,
+        response: ResponseInputItem,
+        max_entries: usize,
+    ) {
+        let mut state = self.state.lock().await;
+        state.put_cached_tool_result(key, response, max_entries);
     }
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
@@ -2073,11 +2092,13 @@ impl Session {
         if let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
         }
-        // Persist the event into rollout (recorder filters as needed)
-        let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
-        self.persist_rollout_items(&rollout_items).await;
-        if let Err(e) = self.tx_event.send(event).await {
-            debug!("dropping event because channel is closed: {e}");
+        let rollout_item =
+            should_persist_event_msg(&event.msg, self.services.rollout_event_persistence_mode)
+                .then(|| RolloutItem::EventMsg(event.msg.clone()));
+
+        self.send_event_to_subscribers(event).await;
+        if let Some(item) = rollout_item.as_ref() {
+            self.persist_rollout_items(std::slice::from_ref(item)).await;
         }
     }
 
@@ -2094,8 +2115,12 @@ impl Session {
         self.persist_rollout_items(&[RolloutItem::EventMsg(event.msg.clone())])
             .await;
         self.flush_rollout().await;
-        if let Err(e) = self.tx_event.send(event).await {
-            debug!("dropping event because channel is closed: {e}");
+        self.send_event_to_subscribers(event).await;
+    }
+
+    async fn send_event_to_subscribers(&self, event: Event) {
+        if let Err(e) = self.tx_event.try_send(event) {
+            debug!("dropping event because subscriber channel is unavailable: {e}");
         }
     }
 
@@ -4235,26 +4260,28 @@ pub(crate) async fn run_turn(
             .await,
     );
 
-    let available_connectors = if turn_context.config.features.enabled(Feature::Apps) {
-        let mcp_tools = match sess
-            .services
-            .mcp_connection_manager
-            .read()
-            .await
-            .list_all_tools()
-            .or_cancel(&cancellation_token)
-            .await
-        {
-            Ok(mcp_tools) => mcp_tools,
-            Err(_) => return None,
+    let (available_connectors, cached_mcp_tools) =
+        if turn_context.config.features.enabled(Feature::Apps) {
+            let mcp_tools = match sess
+                .services
+                .mcp_connection_manager
+                .read()
+                .await
+                .list_all_tools()
+                .or_cancel(&cancellation_token)
+                .await
+            {
+                Ok(mcp_tools) => mcp_tools,
+                Err(_) => return None,
+            };
+            let connectors = connectors::with_app_enabled_state(
+                connectors::accessible_connectors_from_mcp_tools(&mcp_tools),
+                &turn_context.config,
+            );
+            (connectors, Some(Arc::new(mcp_tools)))
+        } else {
+            (Vec::new(), None)
         };
-        connectors::with_app_enabled_state(
-            connectors::accessible_connectors_from_mcp_tools(&mcp_tools),
-            &turn_context.config,
-        )
-    } else {
-        Vec::new()
-    };
     let connector_slug_counts = build_connector_slug_counts(&available_connectors);
     let skill_name_counts_lower = skills_outcome
         .as_ref()
@@ -4413,6 +4440,7 @@ pub(crate) async fn run_turn(
             sampling_request_input,
             &explicitly_enabled_connectors,
             skills_outcome.as_ref(),
+            cached_mcp_tools.clone(),
             cancellation_token.child_token(),
         )
         .await
@@ -4744,6 +4772,7 @@ async fn run_sampling_request(
     input: Vec<ResponseItem>,
     explicitly_enabled_connectors: &HashSet<String>,
     skills_outcome: Option<&SkillLoadOutcome>,
+    cached_mcp_tools: Option<Arc<HashMap<String, crate::mcp_connection_manager::ToolInfo>>>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     let router = built_tools(
@@ -4752,6 +4781,7 @@ async fn run_sampling_request(
         &input,
         explicitly_enabled_connectors,
         skills_outcome,
+        cached_mcp_tools,
         &cancellation_token,
     )
     .await?;
@@ -4867,16 +4897,20 @@ async fn built_tools(
     input: &[ResponseItem],
     explicitly_enabled_connectors: &HashSet<String>,
     skills_outcome: Option<&SkillLoadOutcome>,
+    cached_mcp_tools: Option<Arc<HashMap<String, crate::mcp_connection_manager::ToolInfo>>>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Arc<ToolRouter>> {
-    let mut mcp_tools = sess
-        .services
-        .mcp_connection_manager
-        .read()
-        .await
-        .list_all_tools()
-        .or_cancel(cancellation_token)
-        .await?;
+    let mut mcp_tools = if let Some(cached_tools) = cached_mcp_tools {
+        cached_tools.as_ref().clone()
+    } else {
+        sess.services
+            .mcp_connection_manager
+            .read()
+            .await
+            .list_all_tools()
+            .or_cancel(cancellation_token)
+            .await?
+    };
 
     let mut effective_explicitly_enabled_connectors = explicitly_enabled_connectors.clone();
     effective_explicitly_enabled_connectors.extend(sess.get_connector_selection().await);
@@ -7034,6 +7068,7 @@ mod tests {
             hooks: Hooks::new(HooksConfig {
                 legacy_notify_argv: config.notify.clone(),
             }),
+            rollout_event_persistence_mode: EventPersistenceMode::Limited,
             rollout: Mutex::new(None),
             user_shell: Arc::new(default_user_shell()),
             shell_snapshot_tx: watch::channel(None).0,
@@ -7182,6 +7217,7 @@ mod tests {
             hooks: Hooks::new(HooksConfig {
                 legacy_notify_argv: config.notify.clone(),
             }),
+            rollout_event_persistence_mode: EventPersistenceMode::Limited,
             rollout: Mutex::new(None),
             user_shell: Arc::new(default_user_shell()),
             shell_snapshot_tx: watch::channel(None).0,
